@@ -1,24 +1,10 @@
 from langgraph.graph import StateGraph, MessagesState, START, END
 from typing import Optional, List, Literal
 from pydantic import BaseModel
-from langchain_groq import ChatGroq
-from dotenv import load_dotenv
 import os
 
-load_dotenv()
-
-MENU = {
-    "pizza": {"price": 200, "stock": 20},
-    "burger": {"price": 150, "stock": 15},
-    "coke": {"price": 50, "stock": 50},
-    "french fries": {"price": 120, "stock": 25},
-    "sandwich": {"price": 100, "stock": 18},
-    "pasta": {"price": 220, "stock": 12},
-    "fried rice": {"price": 180, "stock": 10},
-    "noodles": {"price": 170, "stock": 14},
-    "coffee": {"price": 80, "stock": 30},
-    "ice cream": {"price": 90, "stock": 22},
-}
+from helpers.constants import MENU
+from helpers.llm import llm
 
 
 class RequestedItem(BaseModel):
@@ -47,13 +33,6 @@ class State(MessagesState):
     cart: List[Cart]
     order: Order | None = None
     payment: dict[str, any]
-
-
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0,
-    streaming=True
-)
 
 
 def show_menu(state: State) -> dict:

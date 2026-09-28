@@ -4,8 +4,10 @@ A LangGraph-based restaurant ordering agent, exposed as a FastAPI service.
 
 ## Structure
 
-- `agent.py` — the LangGraph agent: menu, intent routing, add/remove cart items. Core logic only, no HTTP.
+- `agent.py` — the LangGraph agent: intent routing, add/remove cart items. Core logic only, no HTTP.
 - `service.py` — FastAPI service layer that wraps `agent.py` and exposes it over HTTP. Also tracks order status/history in memory.
+- `helpers/constants.py` — static data (currently the `MENU`).
+- `helpers/llm.py` — LLM client setup/connectivity (the `ChatGroq` instance), imported by `agent.py`.
 - `.env.example` — copy to `.env` and fill in your `GROQ_API_KEY`.
 
 ## Setup

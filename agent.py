@@ -1,38 +1,10 @@
-from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.graph import StateGraph, START, END
 from typing import Optional, List, Literal
-from pydantic import BaseModel
 import os
 
 from helpers.constants import MENU
 from helpers.llm import llm
-
-
-class RequestedItem(BaseModel):
-    item: str
-    quantity: int
-
-
-class RequestedItems(BaseModel):
-    items: list[RequestedItem]
-
-
-class Cart(BaseModel):
-    item: str
-    quantity: int
-    price: float
-
-
-class Order(BaseModel):
-    status: str
-    order_id: int
-    items: list[Cart]
-
-
-class State(MessagesState):
-    query_count: int = 0
-    cart: List[Cart]
-    order: Order | None = None
-    payment: dict[str, any]
+from helpers.models import RequestedItem, RequestedItems, Cart, Order, State
 
 
 def show_menu(state: State) -> dict:

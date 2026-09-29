@@ -12,6 +12,7 @@ from helpers.models import RequestedItem, RequestedItems, Cart, Order, State
 
 MAX_VERIFY_ATTEMPTS = 3
 MAX_COOKING_RETRIES = 2
+MAX_UNCLEAR_ATTEMPTS = 3
 COOKING_DURATION_MINUTES = 2
 EXTRACTION_RETRY_ATTEMPTS = 2
 _order_id_counter = count(1)
@@ -50,7 +51,7 @@ Be friendly and concise."""),
             "human", f"Menu:\n{menu_items}")
     ]
     response = llm.invoke(messages)
-    return {'query_count': query_c, "messages": [response]}
+    return {'query_count': query_c, "unclear_count": 0, "messages": [response]}
 
 
 def route_intent(
@@ -62,6 +63,7 @@ def route_intent(
     "VIEW_CART",
     "CHECKOUT",
     "COOKING_STAGE",
+    "CLARIFY",
 ]:
     if state.get("status") == "cooking_retry":
         return "COOKING_STAGE"
@@ -76,6 +78,13 @@ ADD_ITEM
 REMOVE_ITEM
 VIEW_CART
 CHECKOUT
+UNCLEAR
+
+Use UNCLEAR only if the message genuinely does not map to any of the
+other intents (e.g. small talk, a question you can't answer from intent
+alone, or something too vague to act on). Do not guess an intent just
+to avoid UNCLEAR.
+
 Return only one allowed intent.
 Do not add punctuation or explanation."""),
         ("human", f"user input is {user_message}"), ]
@@ -87,12 +96,47 @@ Do not add punctuation or explanation."""),
         "REMOVE_ITEM",
         "VIEW_CART",
         "CHECKOUT",
+        "UNCLEAR",
     }
     if intent not in allowed_intents:
-        return "SHOW_MENU"
+        return "CLARIFY"
+    if intent == "UNCLEAR":
+        return "CLARIFY"
     if intent == "ADD_ITEM":
         return "VERIFY_ITEMS"
     return intent
+
+
+def clarify(state: State) -> dict:
+    user_message = state["messages"][-1].content
+    unclear_c = state.get("unclear_count", 0) + 1
+
+    if unclear_c >= MAX_UNCLEAR_ATTEMPTS:
+        response = llm.invoke([
+            ("system",
+             "You are a polite restaurant assistant. The customer has sent "
+             "several messages in a row that are unrelated to ordering food "
+             "here. Apologize kindly, explain you're only able to help with "
+             "the menu and orders at this restaurant, and let them know "
+             "they're welcome to start a new conversation anytime."),
+            ("human", f"Customer said: {user_message}"),
+        ])
+        return {
+            "status": "regretted",
+            "unclear_count": unclear_c,
+            "messages": [response],
+        }
+
+    response = llm.invoke([
+        ("system",
+         "You are a polite restaurant assistant. The customer said something "
+         "that doesn't clearly map to an action you can take. Ask a short, "
+         "friendly clarifying question, offering the things you can help "
+         "with: seeing the menu, ordering, viewing the cart, or checking out. "
+         "Don't guess what they meant."),
+        ("human", f"Customer said: {user_message}"),
+    ])
+    return {"unclear_count": unclear_c, "messages": [response]}
 
 
 def verify_items(state: State) -> dict:
@@ -127,7 +171,7 @@ Return structured output only.""",
         available.append(req)
 
     if not unavailable:
-        return {"status": "cart", "query_count": 0}
+        return {"status": "cart", "query_count": 0, "unclear_count": 0}
 
     query_c = state.get("query_count", 0) + 1
     if query_c >= MAX_VERIFY_ATTEMPTS:
@@ -141,6 +185,7 @@ Return structured output only.""",
         return {
             "status": "regretted",
             "query_count": query_c,
+            "unclear_count": 0,
             "messages": [response],
         }
 
@@ -157,6 +202,7 @@ Return structured output only.""",
     return {
         "status": "verifying",
         "query_count": query_c,
+        "unclear_count": 0,
         "messages": [response],
     }
 
@@ -211,6 +257,7 @@ Return structured output only.""",
     return {
         "cart": updated_cart,
         "status": "cart",
+        "unclear_count": 0,
         "messages": [confirmation],
     }
 
@@ -222,7 +269,7 @@ def view_cart(state: State) -> dict:
             ("system", "You are a polite restaurant assistant."),
             ("human", "Tell the customer their cart is empty."),
         ])
-        return {"messages": [response]}
+        return {"unclear_count": 0, "messages": [response]}
     cart_text = "\n".join(
         f"{item.quantity} x {item.item} @ ₹{item.price}" for item in cart)
     total = sum(item.quantity * item.price for item in cart)
@@ -231,7 +278,7 @@ def view_cart(state: State) -> dict:
                    "customer's cart clearly with the total."),
         ("human", f"Cart:\n{cart_text}\nTotal: ₹{total}"),
     ])
-    return {"messages": [response]}
+    return {"unclear_count": 0, "messages": [response]}
 
 
 def remove_item(state: State):
@@ -278,6 +325,7 @@ Return structured output only.
     updated_cart = list(cart_lookup.values())
     return {
         "cart": updated_cart,
+        "unclear_count": 0,
         "messages": result_messages
     }
 
@@ -290,7 +338,7 @@ def checkout(state: State) -> dict:
             ("human", "Tell the customer their cart is empty, so there is "
                       "nothing to order yet."),
         ])
-        return {"messages": [response]}
+        return {"unclear_count": 0, "messages": [response]}
 
     order = Order(status="ordered", order_id=next(_order_id_counter), items=cart)
     cart_text = "\n".join(f"{i.quantity} x {i.item}" for i in cart)
@@ -299,7 +347,7 @@ def checkout(state: State) -> dict:
                    "was placed and share the order id."),
         ("human", f"Order #{order.order_id} placed:\n{cart_text}"),
     ])
-    return {"order": order, "status": "ordered", "messages": [response]}
+    return {"order": order, "status": "ordered", "unclear_count": 0, "messages": [response]}
 
 
 def cooking_stage(state: State) -> dict:
@@ -385,6 +433,7 @@ builder.add_node("view_cart", view_cart)
 builder.add_node("checkout", checkout)
 builder.add_node("cooking_stage", cooking_stage)
 builder.add_node("delivery", delivery)
+builder.add_node("clarify", clarify)
 
 builder.add_conditional_edges(
     START,
@@ -396,6 +445,7 @@ builder.add_conditional_edges(
         "VIEW_CART": "view_cart",
         "CHECKOUT": "checkout",
         "COOKING_STAGE": "cooking_stage",
+        "CLARIFY": "clarify",
     }
 )
 builder.add_conditional_edges(
@@ -410,6 +460,7 @@ builder.add_edge("show_menu", END)
 builder.add_edge("add_item", END)
 builder.add_edge("remove_item", END)
 builder.add_edge("view_cart", END)
+builder.add_edge("clarify", END)
 builder.add_edge("checkout", "cooking_stage")
 builder.add_conditional_edges(
     "cooking_stage",

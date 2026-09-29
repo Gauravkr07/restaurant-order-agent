@@ -209,6 +209,10 @@
         } catch (e) {}
         pending.remove();
         addMessage(detail, "error");
+        if (res.status === 409 || res.status === 404) {
+          sessionId = null;
+          try { localStorage.removeItem("session_id"); } catch (e) {}
+        }
         return;
       }
 

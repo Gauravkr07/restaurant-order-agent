@@ -40,6 +40,7 @@ class State(MessagesState):
     status: Status = "browsing"
     query_count: int = 0
     cook_retry_count: int = 0
+    unclear_count: int = 0
     cooking_duration: int | None = None
     cart: List[Cart]
     order: Order | None = None

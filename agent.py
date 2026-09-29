@@ -1,3 +1,7 @@
+import random
+from itertools import count
+
+import groq
 from langgraph.graph import StateGraph, START, END
 from typing import Optional, List, Literal
 import os
@@ -5,6 +9,31 @@ import os
 from helpers.constants import MENU
 from helpers.llm import llm
 from helpers.models import RequestedItem, RequestedItems, Cart, Order, State
+
+MAX_VERIFY_ATTEMPTS = 3
+MAX_COOKING_RETRIES = 2
+COOKING_DURATION_MINUTES = 2
+EXTRACTION_RETRY_ATTEMPTS = 2
+_order_id_counter = count(1)
+
+
+def extract_requested_items(human_message: str, system_prompt: str) -> RequestedItems:
+    """Runs structured-item extraction, retrying once if the model flakes
+    (Groq occasionally errors with "Tool choice is required, but model did
+    not call a tool" instead of returning structured output)."""
+    extractor = llm.with_structured_output(RequestedItems)
+    messages = [
+        ("system", system_prompt),
+        ("human", human_message),
+    ]
+    last_error: groq.GroqError | None = None
+    for _ in range(EXTRACTION_RETRY_ATTEMPTS):
+        try:
+            return extractor.invoke(messages)
+        except groq.GroqError as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
 
 
 def show_menu(state: State) -> dict:
@@ -28,11 +57,15 @@ def route_intent(
     state: State,
 ) -> Literal[
     "SHOW_MENU",
-    "ADD_ITEM",
+    "VERIFY_ITEMS",
     "REMOVE_ITEM",
     "VIEW_CART",
     "CHECKOUT",
+    "COOKING_STAGE",
 ]:
+    if state.get("status") == "cooking_retry":
+        return "COOKING_STAGE"
+
     user_message = state["messages"][-1].content
     messages = [
         ("system",
@@ -57,63 +90,161 @@ Do not add punctuation or explanation."""),
     }
     if intent not in allowed_intents:
         return "SHOW_MENU"
+    if intent == "ADD_ITEM":
+        return "VERIFY_ITEMS"
     return intent
 
 
+def verify_items(state: State) -> dict:
+    user_message = state["messages"][-1].content
+    menu_text = "\n".join(
+        [f"{item}: stock={details['stock']}" for item, details in MENU.items()])
+    requested = extract_requested_items(
+        f"User wants: {user_message}",
+        f"""
+You are a restaurant assistant. Available Menu:
+{menu_text}
+Task:
+Extract every food item and quantity the customer is asking for.
+Return structured output only.""",
+    )
+
+    available: list[RequestedItem] = []
+    unavailable: list[str] = []
+    for req in requested.items:
+        menu_entry = MENU.get(req.item)
+        if menu_entry is None:
+            unavailable.append(f"{req.item} is not on our menu")
+            continue
+        stock = menu_entry["stock"]
+        if stock == 0:
+            unavailable.append(f"{req.item} is out of stock")
+            continue
+        if req.quantity > stock:
+            unavailable.append(
+                f"only {stock} {req.item} available (you asked for {req.quantity})")
+            continue
+        available.append(req)
+
+    if not unavailable:
+        return {"status": "cart", "query_count": 0}
+
+    query_c = state.get("query_count", 0) + 1
+    if query_c >= MAX_VERIFY_ATTEMPTS:
+        response = llm.invoke([
+            ("system",
+             "You are a polite restaurant assistant. Apologize that the requested "
+             "items could not be fulfilled after multiple attempts and let the "
+             "customer know they can start over anytime."),
+            ("human", f"Unresolved issues: {'; '.join(unavailable)}"),
+        ])
+        return {
+            "status": "regretted",
+            "query_count": query_c,
+            "messages": [response],
+        }
+
+    available_note = ", ".join(f"{i.quantity} x {i.item}" for i in available) or "none"
+    response = llm.invoke([
+        ("system",
+         "You are a polite restaurant assistant. Some requested items are not "
+         "fully available. Tell the customer which items/quantities are available "
+         "and which are not, and ask if they'd like to continue with just the "
+         "available items/quantities or drop the order."),
+        ("human",
+         f"Available: {available_note}. Issues: {'; '.join(unavailable)}"),
+    ])
+    return {
+        "status": "verifying",
+        "query_count": query_c,
+        "messages": [response],
+    }
+
+
 def add_item(state: State) -> dict:
-    cart_item = state["messages"][-1].content
+    """Re-verifies the last request against MENU and merges it into the cart.
+
+    Runs after verify_items has already confirmed at least the available
+    portion of the order, so this only adds items that pass stock checks
+    again here (defends against stock changing between the two calls).
+    """
+    user_message = state["messages"][-1].content
     menu_text = "\n".join(
         [f"{item}: price={details['price']}, stock={details['stock']}"
          for item, details in MENU.items()])
-    messages = [
-        ("system",
-         f"""
+    response = extract_requested_items(
+        f"User wants: {user_message}",
+        f"""
 You are a restaurant assistant.Available Menu:{menu_text},
 Tasks:
 Extract food items and quantities.
 Verify the item exists.
 Verify stock availability.
-Return structured output only."""),
-        (
-            "human",
-            f"User wants: {cart_item}")
-    ]
-    extractor = llm.with_structured_output(RequestedItems)
-    response = extractor.invoke(messages)
-    updated_cart = []
+Return structured output only.""",
+    )
+
+    cart_lookup = {item.item: item for item in state.get("cart", [])}
+    added: list[RequestedItem] = []
     for item in response.items:
-        if item.item not in MENU:
-            print(f"{item.item}: not available")
+        menu_entry = MENU.get(item.item)
+        if menu_entry is None or menu_entry["stock"] < item.quantity:
             continue
-        stock = MENU.get(item.item).get('stock')
-        if stock == 0:
-            print(f"{item.item}: Out of stock")
-            continue
-        if item.quantity > stock:
-            print(f"{item.item}: Only {stock} available")
-            continue
-        price = MENU.get(item.item).get("price")
-        cart_obj = Cart(
-            item=item.item,
-            quantity=item.quantity,
-            price=price,
-        )
-        updated_cart.append(cart_obj)
-    return {"cart": updated_cart}
+        existing = cart_lookup.get(item.item)
+        if existing:
+            existing.quantity += item.quantity
+        else:
+            cart_lookup[item.item] = Cart(
+                item=item.item,
+                quantity=item.quantity,
+                price=menu_entry["price"],
+            )
+        added.append(item)
+
+    updated_cart = list(cart_lookup.values())
+    added_text = ", ".join(f"{i.quantity} x {i.item}" for i in added) or "nothing new"
+    confirmation = llm.invoke([
+        ("system", "You are a polite restaurant assistant. Confirm what was "
+                   "just added to the cart and ask if the customer wants "
+                   "anything else."),
+        ("human", f"Added: {added_text}"),
+    ])
+    return {
+        "cart": updated_cart,
+        "status": "cart",
+        "messages": [confirmation],
+    }
+
+
+def view_cart(state: State) -> dict:
+    cart = state.get("cart", [])
+    if not cart:
+        response = llm.invoke([
+            ("system", "You are a polite restaurant assistant."),
+            ("human", "Tell the customer their cart is empty."),
+        ])
+        return {"messages": [response]}
+    cart_text = "\n".join(
+        f"{item.quantity} x {item.item} @ ₹{item.price}" for item in cart)
+    total = sum(item.quantity * item.price for item in cart)
+    response = llm.invoke([
+        ("system", "You are a polite restaurant assistant. Present the "
+                   "customer's cart clearly with the total."),
+        ("human", f"Cart:\n{cart_text}\nTotal: ₹{total}"),
+    ])
+    return {"messages": [response]}
 
 
 def remove_item(state: State):
     user_input = state["messages"][-1].content
-    messages = [("system",
-                 f"""
+    response = extract_requested_items(
+        f"remove item{user_input}",
+        """
 You are a restaurant assistant.,
 Tasks:
 Extract food items and quantities.
 Return structured output only.
-"""),
-                ('human', f"remove item{user_input}")]
-    extractor = llm.with_structured_output(RequestedItems)
-    response = extractor.invoke(messages)
+""",
+    )
     cart_lookup = {
         item.item: item
         for item in state["cart"]}
@@ -151,28 +282,159 @@ Return structured output only.
     }
 
 
+def checkout(state: State) -> dict:
+    cart = state.get("cart", [])
+    if not cart:
+        response = llm.invoke([
+            ("system", "You are a polite restaurant assistant."),
+            ("human", "Tell the customer their cart is empty, so there is "
+                      "nothing to order yet."),
+        ])
+        return {"messages": [response]}
+
+    order = Order(status="ordered", order_id=next(_order_id_counter), items=cart)
+    cart_text = "\n".join(f"{i.quantity} x {i.item}" for i in cart)
+    response = llm.invoke([
+        ("system", "You are a polite restaurant assistant. Confirm the order "
+                   "was placed and share the order id."),
+        ("human", f"Order #{order.order_id} placed:\n{cart_text}"),
+    ])
+    return {"order": order, "status": "ordered", "messages": [response]}
+
+
+def cooking_stage(state: State) -> dict:
+    order = state.get("order")
+    retry_count = state.get("cook_retry_count", 0)
+
+    cooking_failed = random.random() < 0.2
+    if cooking_failed and retry_count < MAX_COOKING_RETRIES:
+        response = llm.invoke([
+            ("system", "You are a polite restaurant assistant. Let the "
+                       "customer know there was a small hiccup in the kitchen "
+                       "and you're retrying their order."),
+            ("human", f"Order #{order.order_id if order else '?'} is being retried."),
+        ])
+        return {
+            "status": "cooking_retry",
+            "cooking_duration": None,
+            "cook_retry_count": retry_count + 1,
+            "messages": [response],
+        }
+
+    if cooking_failed:
+        response = llm.invoke([
+            ("system", "You are a polite restaurant assistant. Apologize "
+                       "sincerely that the kitchen could not prepare the order "
+                       "after multiple attempts, and let the customer know a "
+                       "refund will be issued."),
+            ("human", f"Order #{order.order_id if order else '?'} could not "
+                      "be cooked after retries."),
+        ])
+        return {
+            "status": "regretted",
+            "cook_retry_count": 0,
+            "messages": [response],
+        }
+
+    duration = COOKING_DURATION_MINUTES
+    response = llm.invoke([
+        ("system", "You are a polite restaurant assistant. Tell the customer "
+                   "cooking has started and give the estimated time."),
+        ("human", f"Order #{order.order_id if order else '?'} is cooking, "
+                  f"estimated {duration} minutes."),
+    ])
+    return {
+        "status": "cooking",
+        "cooking_duration": duration,
+        "cook_retry_count": 0,
+        "messages": [response],
+    }
+
+
+def delivery(state: State) -> dict:
+    order = state.get("order")
+    if order:
+        order = order.model_copy(update={"status": "delivered"})
+    cart_text = "\n".join(f"{i.quantity} x {i.item}" for i in (order.items if order else []))
+    response = llm.invoke([
+        ("system", "You are a polite restaurant assistant. Tell the customer "
+                   "their order has been delivered, thank them warmly."),
+        ("human", f"Order #{order.order_id if order else '?'} delivered:\n{cart_text}"),
+    ])
+    return {"order": order, "status": "delivered", "messages": [response]}
+
+
+def route_after_verify(state: State) -> Literal["ADD_ITEM", "END"]:
+    if state.get("status") == "cart":
+        return "ADD_ITEM"
+    return "END"
+
+
+def route_after_cooking(state: State) -> Literal["DELIVER", "END"]:
+    if state.get("status") == "cooking":
+        return "DELIVER"
+    return "END"
+
+
 builder = StateGraph(State)
 builder.add_node("show_menu", show_menu)
+builder.add_node("verify_items", verify_items)
+builder.add_node("add_item", add_item)
+builder.add_node("remove_item", remove_item)
+builder.add_node("view_cart", view_cart)
+builder.add_node("checkout", checkout)
+builder.add_node("cooking_stage", cooking_stage)
+builder.add_node("delivery", delivery)
+
 builder.add_conditional_edges(
     START,
     route_intent,
     {
         "SHOW_MENU": "show_menu",
+        "VERIFY_ITEMS": "verify_items",
+        "REMOVE_ITEM": "remove_item",
+        "VIEW_CART": "view_cart",
+        "CHECKOUT": "checkout",
+        "COOKING_STAGE": "cooking_stage",
+    }
+)
+builder.add_conditional_edges(
+    "verify_items",
+    route_after_verify,
+    {
+        "ADD_ITEM": "add_item",
+        "END": END,
     }
 )
 builder.add_edge("show_menu", END)
+builder.add_edge("add_item", END)
+builder.add_edge("remove_item", END)
+builder.add_edge("view_cart", END)
+builder.add_edge("checkout", "cooking_stage")
+builder.add_conditional_edges(
+    "cooking_stage",
+    route_after_cooking,
+    {
+        "DELIVER": "delivery",
+        "END": END,
+    }
+)
+builder.add_edge("delivery", END)
 graph = builder.compile()
 
-from langchain_core.messages import HumanMessage
 
-if __name__ == "__main__":
-    test_state = {
-        "messages": [
-            HumanMessage(content="I want remove 1 pizzas and 1 coke")
-        ],
-        "cart": [
-            Cart(item="pizza", quantity=5, price=200),
-            Cart(item="coke", quantity=2, price=50),
-        ],
-    }
-    print(remove_item(test_state))
+
+
+# from langchain_core.messages import HumanMessage
+
+# if __name__ == "__main__":
+#     test_state = {
+#         "messages": [
+#             HumanMessage(content="I want remove 1 pizzas and 1 coke")
+#         ],
+#         "cart": [
+#             Cart(item="pizza", quantity=5, price=200),
+#             Cart(item="coke", quantity=2, price=50),
+#         ],
+#     }
+#     print(remove_item(test_state))

@@ -29,13 +29,31 @@ class FakeStructuredExtractor:
         return outcome
 
 
+class FakeToolCallingLLM:
+    """Stands in for llm.bind_tools([...]) in run_add_item_agent: on the
+    first invoke() returns one AIMessage per queued tool call, then a
+    final plain AIMessage with no tool_calls to end the loop."""
+
+    def __init__(self, tool_calls):
+        self._tool_calls = tool_calls
+        self._called = False
+
+    def invoke(self, messages):
+        if not self._called:
+            self._called = True
+            return AIMessage(content="", tool_calls=self._tool_calls)
+        return AIMessage(content="done", tool_calls=[])
+
+
 class FakeLLM:
-    def __init__(self, intent="SHOW_MENU", reply_text="ok", extraction_result=None):
+    def __init__(self, intent="SHOW_MENU", reply_text="ok", extraction_result=None, tool_calls=None, verdict=None):
         self.intent = intent
         self.reply_text = reply_text
         self.extraction_result = (
             extraction_result if extraction_result is not None else RequestedItems(items=[])
         )
+        self.tool_calls = tool_calls or []
+        self.verdict = verdict
         self.classify_calls = 0
         self.invoke_calls = 0
 
@@ -48,7 +66,12 @@ class FakeLLM:
         return AIMessage(content=self.reply_text)
 
     def with_structured_output(self, schema):
+        if self.verdict is not None and schema.__name__ == "UnavailableItems":
+            return FakeStructuredExtractor(self.verdict)
         return FakeStructuredExtractor(self.extraction_result)
+
+    def bind_tools(self, tools):
+        return FakeToolCallingLLM(self.tool_calls)
 
 
 class FakeRepository:
@@ -124,6 +147,7 @@ def fake_llm(monkeypatch):
 def fake_repository(monkeypatch):
     repo = FakeRepository()
     monkeypatch.setattr("agent.repository", repo)
+    monkeypatch.setattr("agent_tools.repository", repo)
     return repo
 
 

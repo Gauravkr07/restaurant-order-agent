@@ -28,6 +28,20 @@ class RequestedItems(BaseModel):
     items: list[RequestedItem]
 
 
+class UnavailableItem(BaseModel):
+    item: str
+    reason: str
+
+
+class UnavailableItems(BaseModel):
+    unavailable: list[UnavailableItem]
+
+
+class AddItemVerdict(BaseModel):
+    added: list[RequestedItem]
+    unavailable: list[UnavailableItem]
+
+
 class Cart(BaseModel):
     item: str
     quantity: int

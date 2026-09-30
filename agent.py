@@ -1,15 +1,20 @@
+import json
 import random
 import re
 
 import groq
+from langchain_core.messages import ToolMessage
 from langgraph.graph import StateGraph, START, END
 from pydantic import ValidationError
 from typing import Literal
 
+from agent_tools import add_to_cart, get_menu_item, search_menu
 from db import repository
 from helpers.llm import llm
 from helpers.logging_config import get_logger
-from helpers.models import RequestedItem, RequestedItems, State
+from helpers.models import AddItemVerdict, RequestedItem, RequestedItems, UnavailableItem, UnavailableItems, State
+
+MAX_TOOL_CALL_ROUNDS = 6
 
 logger = get_logger(__name__)
 
@@ -87,6 +92,87 @@ def extract_requested_items(human_message: str, system_prompt: str) -> Requested
         "extraction_failed",
         extra={"attempts": EXTRACTION_RETRY_ATTEMPTS, "error_type": type(last_error).__name__},
     )
+    assert last_error is not None
+    raise last_error
+
+
+ADD_ITEM_TOOLS = [search_menu, get_menu_item, add_to_cart]
+
+
+def run_add_item_agent(session_id: str, user_message: str) -> AddItemVerdict:
+    """Phase 2 tool-based agent: instead of extracting structured items
+    and checking stock in Python, the LLM is given search_menu/
+    get_menu_item/add_to_cart directly and decides itself which to call
+    and when, in a loop (call tool -> see result -> call another tool or
+    finish). It's told explicitly to only call add_to_cart for items it
+    has confirmed are in stock. Once the loop ends, a second structured-
+    output call turns the conversation into an AddItemVerdict so
+    verify_items gets reliable structured data instead of parsed prose.
+    """
+    tool_llm = llm.bind_tools(ADD_ITEM_TOOLS)
+    system_prompt = (
+        "You are a restaurant ordering assistant with tools to look up "
+        "the menu and add items to a cart. The customer's session_id is "
+        f'"{session_id}" - pass it to any tool that takes one.\n\n'
+        "Steps: for each item the customer asks for, call get_menu_item "
+        "(or search_menu if the name is unclear) to check it exists and "
+        "has enough stock. Only call add_to_cart for items that are "
+        "confirmed in stock in the requested quantity. Never call "
+        "add_to_cart for an item that doesn't exist or lacks stock.\n\n"
+        "When you have resolved every item the customer asked for, stop "
+        "calling tools and reply with a short plain-text summary: what "
+        "was added, and for anything you could NOT add, name the item "
+        "and say exactly why (not on menu / out of stock / insufficient "
+        "stock, with the actual available quantity if you know it)."
+        + UNTRUSTED_INPUT_NOTICE
+    )
+    messages = [("system", system_prompt), ("human", user_message)]
+
+    added: list[RequestedItem] = []
+    for _ in range(MAX_TOOL_CALL_ROUNDS):
+        ai_message = tool_llm.invoke(messages)
+        messages.append(ai_message)
+        if not ai_message.tool_calls:
+            break
+        for call in ai_message.tool_calls:
+            tool = next(t for t in ADD_ITEM_TOOLS if t.name == call["name"])
+            result = tool.invoke(call["args"])
+            if call["name"] == "add_to_cart":
+                added.append(RequestedItem(item=call["args"]["item_name"], quantity=call["args"]["quantity"]))
+            messages.append(ToolMessage(content=json.dumps(result, default=str), tool_call_id=call["id"]))
+    else:
+        logger.warning("add_item_agent_max_rounds_reached", extra={"rounds": MAX_TOOL_CALL_ROUNDS})
+
+    final_summary = ai_message.content if isinstance(ai_message.content, str) else str(ai_message.content)
+    unavailable = extract_unavailable_items(final_summary)
+    return AddItemVerdict(added=added, unavailable=unavailable)
+
+
+def extract_unavailable_items(summary_text: str) -> list[UnavailableItem]:
+    """A fresh, tool-free structured-output call (no tool-call/tool-result
+    history in context) that pulls the unavailable items and reasons out
+    of run_add_item_agent's final plain-text summary. Kept separate from
+    the tool-calling messages because asking for structured output in the
+    same context as tool-call history is what triggers Groq's "Tool
+    choice is required, but model did not call a tool" error."""
+    extractor = llm.with_structured_output(UnavailableItems)
+    messages = [
+        ("system",
+         "Extract which items could not be fulfilled from the summary "
+         "below, with a short reason each. If everything was fulfilled, "
+         "return an empty list."),
+        ("human", summary_text or "(no items were unavailable)"),
+    ]
+    last_error: Exception | None = None
+    for attempt in range(EXTRACTION_RETRY_ATTEMPTS):
+        try:
+            return extractor.invoke(messages).unavailable
+        except (groq.GroqError, ValidationError) as exc:
+            last_error = exc
+            logger.warning(
+                "add_item_verdict_retry",
+                extra={"attempt": attempt + 1, "error_type": type(exc).__name__},
+            )
     assert last_error is not None
     raise last_error
 
@@ -210,50 +296,44 @@ def clarify(state: State) -> dict:
 
 
 def verify_items(state: State) -> dict:
+    """Phase 2 tool-based node: run_add_item_agent lets the LLM decide
+    which menu/cart tools to call (see agent_tools.py) instead of a
+    hardcoded extract-then-check-then-add pipeline. Whatever it manages
+    to add is already committed to the cart in Postgres by the time this
+    returns - this function only decides the resulting conversation
+    status (cart / verifying / regretted) from the verdict.
+    """
     logger.info("node_verify_items")
+    session_id = state["session_id"]
     user_message = state["messages"][-1].content
-    menu_items = repository.get_active_menu_items()
-    menu_by_name = {item["name"]: item for item in menu_items}
-    menu_text = "\n".join(f"{item['name']}: stock={item['stock']}" for item in menu_items)
-    requested = extract_requested_items(
-        f"User wants: {user_message}",
-        f"""
-You are a restaurant assistant. Available Menu:
-{menu_text}
-Task:
-Extract every food item and quantity the customer is asking for.
-Return structured output only.""",
-    )
+    verdict = run_add_item_agent(session_id, user_message)
 
-    available: list[RequestedItem] = []
-    unavailable: list[str] = []
-    for req in requested.items:
-        menu_entry = menu_by_name.get(req.item)
-        if menu_entry is None:
-            unavailable.append(f"{req.item} is not on our menu")
-            continue
-        stock = menu_entry["stock"]
-        if stock == 0:
-            unavailable.append(f"{req.item} is out of stock")
-            continue
-        if req.quantity > stock:
-            unavailable.append(
-                f"only {stock} {req.item} available (you asked for {req.quantity})")
-            continue
-        available.append(req)
+    if not verdict.unavailable:
+        logger.info("add_item_result", extra={"added": [i.item for i in verdict.added]})
+        added_text = ", ".join(f"{i.quantity} x {i.item}" for i in verdict.added) or "nothing new"
+        confirmation = llm.invoke([
+            ("system", "You are a polite restaurant assistant. Confirm what "
+                       "was just added to the cart and ask if the customer "
+                       "wants anything else."),
+            ("human", f"Added: {added_text}"),
+        ])
+        return {
+            "status": "cart",
+            "query_count": 0,
+            "unclear_count": 0,
+            "messages": [confirmation],
+        }
 
-    if not unavailable:
-        return {"status": "cart", "query_count": 0, "unclear_count": 0}
-
+    issues = [f"{u.item}: {u.reason}" for u in verdict.unavailable]
     query_c = state.get("query_count", 0) + 1
     if query_c >= MAX_VERIFY_ATTEMPTS:
-        logger.warning("session_closed_verify_limit", extra={"query_count": query_c, "issues": unavailable})
+        logger.warning("session_closed_verify_limit", extra={"query_count": query_c, "issues": issues})
         response = llm.invoke([
             ("system",
              "You are a polite restaurant assistant. Apologize that the requested "
              "items could not be fulfilled after multiple attempts and let the "
              "customer know they can start over anytime."),
-            ("human", f"Unresolved issues: {'; '.join(unavailable)}"),
+            ("human", f"Unresolved issues: {'; '.join(issues)}"),
         ])
         return {
             "status": "regretted",
@@ -262,73 +342,22 @@ Return structured output only.""",
             "messages": [response],
         }
 
-    logger.info("verify_items_partial", extra={"query_count": query_c, "issues": unavailable})
-    available_note = ", ".join(f"{i.quantity} x {i.item}" for i in available) or "none"
+    logger.info("verify_items_partial", extra={"query_count": query_c, "issues": issues})
+    added_note = ", ".join(f"{i.quantity} x {i.item}" for i in verdict.added) or "none"
     response = llm.invoke([
         ("system",
          "You are a polite restaurant assistant. Some requested items are not "
-         "fully available. Tell the customer which items/quantities are available "
-         "and which are not, and ask if they'd like to continue with just the "
-         "available items/quantities or drop the order."),
+         "fully available. Tell the customer which items/quantities were "
+         "already added and which are not available, and ask if they'd like "
+         "to continue with what's available or drop the rest."),
         ("human",
-         f"Available: {available_note}. Issues: {'; '.join(unavailable)}"),
+         f"Added: {added_note}. Issues: {'; '.join(issues)}"),
     ])
     return {
         "status": "verifying",
         "query_count": query_c,
         "unclear_count": 0,
         "messages": [response],
-    }
-
-
-def add_item(state: State) -> dict:
-    """Re-verifies the last request against the menu and merges it into
-    the cart in Postgres (add_cart_item upserts - merge, not replace).
-
-    Runs after verify_items has already confirmed at least the available
-    portion of the order, so this only adds items that pass stock checks
-    again here (defends against stock changing between the two calls).
-    """
-    logger.info("node_add_item")
-    session_id = state["session_id"]
-    user_message = state["messages"][-1].content
-    menu_items = repository.get_active_menu_items()
-    menu_by_name = {item["name"]: item for item in menu_items}
-    menu_text = "\n".join(
-        f"{item['name']}: price={item['price']}, stock={item['stock']}" for item in menu_items
-    )
-    response = extract_requested_items(
-        f"User wants: {user_message}",
-        f"""
-You are a restaurant assistant.Available Menu:{menu_text},
-Tasks:
-Extract food items and quantities.
-Verify the item exists.
-Verify stock availability.
-Return structured output only.""",
-    )
-
-    added: list[RequestedItem] = []
-    for item in response.items:
-        menu_entry = menu_by_name.get(item.item)
-        if menu_entry is None or menu_entry["stock"] < item.quantity:
-            continue
-        repository.add_cart_item(session_id, item.item, item.quantity)
-        added.append(item)
-
-    cart_size = len(repository.get_cart_items(session_id))
-    added_text = ", ".join(f"{i.quantity} x {i.item}" for i in added) or "nothing new"
-    logger.info("add_item_result", extra={"added": added_text, "cart_size": cart_size})
-    confirmation = llm.invoke([
-        ("system", "You are a polite restaurant assistant. Confirm what was "
-                   "just added to the cart and ask if the customer wants "
-                   "anything else."),
-        ("human", f"Added: {added_text}"),
-    ])
-    return {
-        "status": "cart",
-        "unclear_count": 0,
-        "messages": [confirmation],
     }
 
 
@@ -498,12 +527,6 @@ def delivery(state: State) -> dict:
     return {"status": "delivered", "messages": [response]}
 
 
-def route_after_verify(state: State) -> Literal["ADD_ITEM", "END"]:
-    if state.get("status") == "cart":
-        return "ADD_ITEM"
-    return "END"
-
-
 def route_after_cooking(state: State) -> Literal["DELIVER", "END"]:
     if state.get("status") == "cooking":
         return "DELIVER"
@@ -513,7 +536,6 @@ def route_after_cooking(state: State) -> Literal["DELIVER", "END"]:
 builder = StateGraph(State)
 builder.add_node("show_menu", show_menu)
 builder.add_node("verify_items", verify_items)
-builder.add_node("add_item", add_item)
 builder.add_node("remove_item", remove_item)
 builder.add_node("view_cart", view_cart)
 builder.add_node("checkout", checkout)
@@ -534,16 +556,8 @@ builder.add_conditional_edges(
         "CLARIFY": "clarify",
     }
 )
-builder.add_conditional_edges(
-    "verify_items",
-    route_after_verify,
-    {
-        "ADD_ITEM": "add_item",
-        "END": END,
-    }
-)
 builder.add_edge("show_menu", END)
-builder.add_edge("add_item", END)
+builder.add_edge("verify_items", END)
 builder.add_edge("remove_item", END)
 builder.add_edge("view_cart", END)
 builder.add_edge("clarify", END)

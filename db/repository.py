@@ -243,6 +243,19 @@ def get_order(order_id: int) -> dict | None:
         }
 
 
+def cancel_order(order_id: int) -> dict | None:
+    """Only valid before cooking has started - once status is "cooking"
+    or later, use the refund path in cooking_stage instead."""
+    with SessionLocal() as db:
+        order = db.get(Order, order_id)
+        if order is None or order.status not in ("ordered",):
+            return None
+        order.status = "cancelled"
+        order.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        return get_order(order_id)
+
+
 def update_order_status(order_id: int, status: str) -> dict | None:
     with SessionLocal() as db:
         order = db.get(Order, order_id)

@@ -1,7 +1,7 @@
 from typing import Any, List, Literal
 
 from langgraph.graph import MessagesState
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 Status = Literal[
     "browsing",
@@ -14,10 +14,14 @@ Status = Literal[
     "regretted",
 ]
 
+# A single order line can't be <= 0 (meaningless/negative) or absurdly large
+# (guards against a flaky LLM extraction hallucinating a huge number).
+MAX_ITEM_QUANTITY = 50
+
 
 class RequestedItem(BaseModel):
     item: str
-    quantity: int
+    quantity: int = Field(gt=0, le=MAX_ITEM_QUANTITY)
 
 
 class RequestedItems(BaseModel):
@@ -41,6 +45,7 @@ class State(MessagesState):
     query_count: int = 0
     cook_retry_count: int = 0
     unclear_count: int = 0
+    turn_count: int = 0
     cooking_duration: int | None = None
     cart: List[Cart]
     order: Order | None = None

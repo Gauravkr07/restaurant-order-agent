@@ -9,6 +9,15 @@ Information:
 3. I used state query_count, cart (using pydantic models), order (using pydantic models), payment (not implemented yet)
 4. I already created basic structure where you can find multiple nodes (route_intent, show_menu). I also added conditional_edge for all nodes. I implemented that user sees menu using show_menu, user gives order though message, and we need to verify that quantity is present from menu. If present, we will add in cart (add_item) which is state. I also implemented remove quantity (remove_item) node and validate through user input, and also can verify cart using 'view_cart' node.
 It can create order also if available items are in cart.
+5. Session state (query_count, cook_retry_count, status, cart, order) should live server-side, not be round-tripped by the client every time — client should only ever send the message and a session_id.
+6. Add exception handling for Groq errors (token expiration, invalid API key, and other Groq errors) — don't let a raw 500 leak out.
+7. Provide a simple chat UI.
+8. Cooking duration should be a fixed 2 minutes, not random up to 30 for now.
+9. The response should always surface order_id at the top level too, not just nested inside order.
+10. If cooking fails and retries, the next customer message must resume cooking, not get misrouted into a random intent.
+11. Session persistence must survive server restarts — use Redis instead of an in-memory dict, one Redis key per session, JSON-encoded, with TTL-based expiry so abandoned sessions clean themselves up.
+12. Routing should be more agentic — don't force ambiguous or off-topic messages into one of the fixed intents. Add an UNCLEAR intent and a clarify node that asks the customer what they meant instead of guessing.
+13. If a customer sends 3 consecutive off-topic/unclear messages, close the session with an apologetic message (reuse status = "regretted") and reject further messages to that session (409) until they start a new one.
 
 Task:
 1. Append attributes in state: status
@@ -18,7 +27,8 @@ Task:
 5. We will create order using all cart item, and also store in order attribute in state. Order also update the status 'order' and 'order_id' can fetch order details and also items with quantity.
 6. It will call cooking_stage node, food preparation started and it will update state 'cooking' and also return duration randomly upto 30 min. If any issue come in cooking and fail, it will retry two time and still not fixed then go back to user and told about refund, also add some sorry message.
 7. If cooking done, delivery_item will need to trigger with order_id, items and also change status to delivered.
-
+8. Add proper test coverage — HIGH priority. Testcases should be tracked in prompt_testcase.md, and the README should reference how to run them (see "Testing" section in README.md).
+9. Implement Docker so the whole thing (app + Redis) can be run with one command — see Dockerfile / docker-compose.yml and the "Run with Docker" section in README.md.
 
 Careful:
 1. Always act kind and polite with customer.
@@ -29,3 +39,16 @@ Careful:
 
 Output:
 1. Please also take care about response will be well organized, use pydantic request and response schema if required.
+
+---
+
+## Instructions (dated)
+
+New instructions given from here on, appended as they come in.
+
+- **2026-09-30**: Track every new instruction here going forward, tagged with the date it was given.
+- **2026-09-30**: I want to debug langgraph properly, so I can track errors, workflow, latency, and token utilization. i want to implement LangSmith for this — need tracing set up for the graph so I can see each node run, how long it takes, and how many tokens it used.
+- **2026-09-30**: Add guardrails to the project: invalid quantity, unknown menu item, negative quantity, prompt injection attempt, tool input validation, maximum workflow iterations, LLM timeout, LLM failure fallback.
+- **2026-09-30**: Implement proper logging across the app (currently just a stray print() in show_menu).
+- **2026-09-30**: Implement CI/CD for the project.
+

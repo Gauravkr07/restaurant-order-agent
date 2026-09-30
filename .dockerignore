@@ -1,0 +1,11 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+.pytest_cache/
+tests/
+prompt*.md
+graph implementation.txt
+demo.png

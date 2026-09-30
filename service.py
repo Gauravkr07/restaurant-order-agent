@@ -20,6 +20,7 @@ Endpoints:
 """
 import json
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -30,11 +31,15 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 import agent
+from helpers.logging_config import current_session_id, get_logger
+
+logger = get_logger(__name__)
 
 SESSION_TTL_SECONDS = 60 * 60 * 24  # sessions expire after 24h of inactivity
+MAX_TURNS_PER_SESSION = 50  # hard cap so a session can't run forever
 redis_client = redis.Redis.from_url(
     os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
     decode_responses=True,
@@ -53,6 +58,7 @@ def index() -> FileResponse:
 
 @app.exception_handler(groq.AuthenticationError)
 def handle_groq_auth_error(request: Request, exc: groq.AuthenticationError) -> JSONResponse:
+    logger.error("groq_auth_error", exc_info=True)
     return JSONResponse(
         status_code=502,
         content={"detail": "The restaurant assistant is misconfigured (invalid or expired GROQ_API_KEY). Please contact support."},
@@ -61,6 +67,7 @@ def handle_groq_auth_error(request: Request, exc: groq.AuthenticationError) -> J
 
 @app.exception_handler(groq.RateLimitError)
 def handle_groq_rate_limit(request: Request, exc: groq.RateLimitError) -> JSONResponse:
+    logger.warning("groq_rate_limited")
     return JSONResponse(
         status_code=503,
         content={"detail": "The restaurant assistant is receiving too many requests right now. Please try again shortly."},
@@ -69,6 +76,7 @@ def handle_groq_rate_limit(request: Request, exc: groq.RateLimitError) -> JSONRe
 
 @app.exception_handler(groq.APIStatusError)
 def handle_groq_api_error(request: Request, exc: groq.APIStatusError) -> JSONResponse:
+    logger.error("groq_api_error", exc_info=True)
     return JSONResponse(
         status_code=502,
         content={"detail": "The restaurant assistant is temporarily unavailable. Please try again shortly."},
@@ -77,9 +85,19 @@ def handle_groq_api_error(request: Request, exc: groq.APIStatusError) -> JSONRes
 
 @app.exception_handler(groq.GroqError)
 def handle_groq_error(request: Request, exc: groq.GroqError) -> JSONResponse:
+    logger.error("groq_error", exc_info=True)
     return JSONResponse(
         status_code=502,
         content={"detail": "The restaurant assistant hit a hiccup understanding that message. Please try rephrasing or try again."},
+    )
+
+
+@app.exception_handler(ValidationError)
+def handle_validation_error(request: Request, exc: ValidationError) -> JSONResponse:
+    logger.warning("validation_error", extra={"errors": exc.errors()})
+    return JSONResponse(
+        status_code=422,
+        content={"detail": "Couldn't understand the quantity or item in that message — try rephrasing (e.g. \"2 pizzas\")."},
     )
 
 # --- conversation state, keyed by session_id, persisted in Redis ---
@@ -98,6 +116,7 @@ def _new_session_state() -> dict[str, Any]:
         "query_count": 0,
         "cook_retry_count": 0,
         "unclear_count": 0,
+        "turn_count": 0,
         "cart": [],
         "order": None,
     }
@@ -157,35 +176,86 @@ def get_menu() -> dict[str, Any]:
 
 @app.post("/chat")
 def chat(req: ChatRequest) -> ChatResponse:
+    start_time = time.monotonic()
     if req.session_id is None:
         session_id = str(uuid.uuid4())
         session_state = _new_session_state()
+        current_session_id.set(session_id)
+        logger.info("session_created")
     else:
         session_id = req.session_id
+        current_session_id.set(session_id)
         session_state = _load_session(session_id)
         if session_state is None:
+            logger.warning("unknown_session_id")
             raise HTTPException(status_code=404, detail="Unknown session_id")
         if session_state["status"] == "regretted":
+            logger.info("rejected_closed_session")
             raise HTTPException(
                 status_code=409,
                 detail="This conversation has ended. Please start a new session to order again.",
             )
+        if session_state["turn_count"] >= MAX_TURNS_PER_SESSION:
+            logger.warning("session_turn_limit_reached", extra={"turn_count": session_state["turn_count"]})
+            raise HTTPException(
+                status_code=409,
+                detail="This conversation has gone on for a while - please start a new session to continue.",
+            )
+
+    session_state["turn_count"] = session_state["turn_count"] + 1
+
+    logger.info(
+        "chat_request",
+        extra={"turn_count": session_state["turn_count"], "message_length": len(req.message)},
+    )
 
     state = {
         "messages": [HumanMessage(content=req.message)],
         **session_state,
     }
-    result = agent.graph.invoke(state)
+    try:
+        result = agent.graph.invoke(state)
+    except groq.GroqError:
+        # The LLM is down/timing out/rate-limited beyond what our own
+        # retries handle. Don't advance or persist session state - the
+        # turn never completed - just hand back a graceful message so
+        # the customer isn't shown a raw error, and they can try again
+        # from exactly where they left off.
+        logger.error(
+            "llm_failure_fallback",
+            extra={"duration_ms": round((time.monotonic() - start_time) * 1000)},
+            exc_info=True,
+        )
+        order = session_state["order"]
+        return ChatResponse(
+            session_id=session_id,
+            reply=(
+                "Sorry, I'm having trouble processing that right now. "
+                "Please try again in a moment."
+            ),
+            status=session_state["status"],
+            cart=session_state["cart"],
+            order=order,
+            order_id=order.order_id if order else None,
+            cooking_duration=None,
+        )
 
     session_state = {
         "status": result.get("status", session_state["status"]),
         "query_count": result.get("query_count", session_state["query_count"]),
         "cook_retry_count": result.get("cook_retry_count", session_state["cook_retry_count"]),
         "unclear_count": result.get("unclear_count", session_state["unclear_count"]),
+        "turn_count": session_state["turn_count"],
         "cart": result.get("cart", session_state["cart"]),
         "order": result.get("order", session_state["order"]),
     }
     _save_session(session_id, session_state)
+
+    duration_ms = round((time.monotonic() - start_time) * 1000)
+    logger.info(
+        "chat_response",
+        extra={"status": session_state["status"], "duration_ms": duration_ms},
+    )
 
     last_message = result["messages"][-1]
     content = getattr(last_message, "content", last_message)

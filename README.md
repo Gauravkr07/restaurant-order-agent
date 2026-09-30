@@ -17,9 +17,12 @@ A LangGraph-based restaurant ordering agent, exposed as a FastAPI service.
 - `helpers/constants.py` — static data (currently the `MENU`).
 - `helpers/llm.py` — LLM client setup/connectivity (the `ChatGroq` instance), imported by `agent.py`.
 - `helpers/models.py` — all Pydantic/data models (`RequestedItem`, `RequestedItems`, `Cart`, `Order`, `State`, `Status`), imported by `agent.py`.
+- `helpers/logging_config.py` — structured JSON logging setup, shared across `agent.py` and `service.py` (see [Logging](#logging)).
 - `static/index.html` — a minimal browser chat UI for `/chat` (plain HTML/JS, no build step).
 - `demo.png` — screenshot of the UI, shown at the top of this README (not committed by default — add your own).
-- `.env.example` — copy to `.env` and fill in your `GROQ_API_KEY` (and optionally `REDIS_URL`).
+- `tests/` — pytest suite covering `agent.py`'s nodes (see [Testing](#testing)).
+- `Dockerfile` / `docker-compose.yml` — containerized app + Redis (see [Run with Docker](#run-with-docker)).
+- `.env.example` — copy to `.env` and fill in your `GROQ_API_KEY` (and optionally `REDIS_URL`, `LANGSMITH_*` — see [Debugging & tracing](#debugging--tracing-langsmith)).
 
 ## Setup
 
@@ -49,6 +52,26 @@ Service runs at http://localhost:8000:
 
 - **http://localhost:8000/** — browser chat UI (fastest way to try the agent)
 - **http://localhost:8000/docs** — interactive API docs (Swagger)
+
+### Run with Docker
+
+A `docker-compose.yml` runs the app and Redis together — no local Python venv or `brew install redis` needed:
+
+```bash
+cp .env.example .env   # then edit .env with your real GROQ_API_KEY
+docker compose up --build
+```
+
+This starts two containers:
+
+- `redis` — a `redis:7-alpine` container, persisted via a named volume (`redis-data`) so sessions survive `docker compose restart`.
+- `app` — the FastAPI service, built from the `Dockerfile`, connecting to the `redis` container over Docker's internal network (`REDIS_URL=redis://redis:6379/0` — note the hostname is the Compose service name `redis`, not `localhost`, since containers resolve each other by service name).
+
+`docker-compose.yml` reads `GROQ_API_KEY` from your `.env` file in the same directory. The app container won't start cooking/verifying anything until Redis reports healthy (`depends_on: condition: service_healthy`).
+
+Same URLs as running locally: http://localhost:8000/ for the chat UI, http://localhost:8000/docs for the API docs.
+
+To stop: `docker compose down` (add `-v` to also delete the Redis volume and its stored sessions).
 
 ## Conversation flow
 
@@ -112,6 +135,74 @@ How it works (`service.py`):
 
 `agent.py` (the LangGraph logic itself) is untouched by this — session storage is entirely a `service.py` concern, which is why swapping it didn't require any changes to the graph.
 
+## Debugging & tracing (LangSmith)
+
+By default there's no visibility into what the graph actually did on a given turn — which node ran, how long each LLM call took, how many tokens it used, or where an error came from. [LangSmith](https://smith.langchain.com) (LangChain's own tracing platform) plugs into that gap with basically no code changes, since `agent.py` is already built with `langchain-core`/`langgraph`, both of which know how to emit traces to it automatically.
+
+To turn it on, add these to `.env` (see `.env.example`):
+
+```bash
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=your_langsmith_api_key_here
+LANGSMITH_PROJECT=restaurant-order-agent
+```
+
+Get a free API key at [smith.langchain.com](https://smith.langchain.com). With tracing on, every `/chat` request produces a full trace in the LangSmith dashboard showing:
+
+- **Workflow**: the exact sequence of nodes the graph ran for that message (`route_intent → verify_items → add_item`, etc.) as a visual tree.
+- **Latency**: how long each node and each individual LLM call took, so a slow turn can be traced to the specific step causing it.
+- **Token usage**: prompt/completion tokens per LLM call, and totals per request.
+- **Errors**: if a node raises (a Groq flake, an unexpected state), the trace shows exactly which step failed and with what exception, instead of just a log line.
+
+Leaving `LANGSMITH_TRACING` unset (or `false`) disables tracing entirely — the app behaves exactly the same either way, this is purely additive observability, not a dependency the app needs to run.
+
+## Logging
+
+The app logs structured JSON lines to stdout (`helpers/logging_config.py`) — no log files to manage, since `docker compose logs` (or any container log driver) already captures and retains stdout. Each line is one JSON object, e.g.:
+
+```json
+{"timestamp": "2026-09-30T04:07:49+0000", "level": "INFO", "logger": "agent", "message": "route_intent_decision", "session_id": "8e85fbe9-...", "intent": "ADD_ITEM", "route": "VERIFY_ITEMS"}
+```
+
+What's logged:
+
+- **Every graph node execution** (`node_show_menu`, `node_verify_items`, `node_add_item`, etc.) and the routing decisions `route_intent` makes, with the classified intent and the node it routed to.
+- **Guardrail events**: prompt injection attempts caught (`prompt_injection_detected`), extraction retries and failures, session closures (3-strike unclear limit, verify-attempt limit, cooking failures, turn-count limit).
+- **Request-level timing**: `chat_request`/`chat_response` in `service.py` log message length in, final status and total duration (`duration_ms`) out.
+- **Errors**: every Groq exception handler and the LLM-failure fallback path log with a full traceback (`exc_info=True`), and validation errors log the specific field(s) that failed.
+
+Every log line emitted while handling a `/chat` request — whether from `service.py` or from a graph node deep inside `agent.py` — automatically carries the same `session_id`, via a `contextvars.ContextVar` set once per request (see `current_session_id` in `helpers/logging_config.py`). This makes it possible to filter logs down to one customer's entire conversation without threading a session id through every function signature.
+
+Set `LOG_LEVEL` in `.env` to control verbosity (defaults to `INFO`; use `DEBUG` for more detail, `WARNING` to quiet things down).
+
+## Testing
+
+The test suite covers `agent.py`'s node functions directly — the LLM is replaced with a fake (`tests/conftest.py`'s `FakeLLM`) so tests run offline, deterministically, and in well under a second, with no Groq API key or running Redis server required.
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+What's covered (see `prompt_testcase.md` for the full spec this suite was built from):
+
+- **Verification / retry / regret**: full availability → cart; partial availability → asks the user and increments `query_count`; 3rd failed attempt → regret message (`test_verify_items.py`).
+- **Cart merge**: adding more of an item already in the cart sums the quantity instead of replacing it (`test_add_item.py`).
+- **Cart removal**: partial removal, full removal, over-removal, and removing an item not in the cart (`test_remove_item.py`).
+- **Checkout → cooking → delivery**: order creation, the cooking success/retry/regret-with-refund paths (with `random.random` monkeypatched for determinism), and delivery marking the order delivered (`test_checkout_cooking_delivery.py`).
+- **Routing**: `ADD_ITEM` → `VERIFY_ITEMS` remap, `UNCLEAR`/unparseable model output → `CLARIFY` (not a silent `SHOW_MENU` guess), and the `cooking_retry` short-circuit that skips LLM classification entirely (`test_route_intent.py`).
+- **3-strike session close**: consecutive unclear messages incrementing `unclear_count`, and the 3rd one closing the session (`test_clarify.py`).
+- **Flaky-extraction retry**: `extract_requested_items` retrying once on a `groq.GroqError` and raising once retries are exhausted (`test_extract_requested_items.py`).
+
+## CI/CD
+
+`.github/workflows/ci.yml` runs on GitHub Actions with two jobs:
+
+- **`test`** — on every push (any branch) and every pull request targeting `main`: installs `requirements-dev.txt` and runs the full `pytest` suite. No Groq API key or Redis instance needed, since the suite is fully offline (see [Testing](#testing)).
+- **`publish`** — only after `test` passes, and only on a direct push to `main` (`needs: test` + a branch/event condition, so a broken build can never be published): builds the Docker image and pushes it to GitHub Container Registry as `ghcr.io/<owner>/<repo>:latest` and `:<commit-sha>`. Uses the automatic `GITHUB_TOKEN` GitHub provides to every workflow run — no extra secrets or accounts to set up.
+
+This covers CI (automated testing on every change) and CD up through "produce a deployable, versioned image" — it does not deploy that image anywhere yet, since that depends on where you eventually host the app (a VPS, a cloud container service, etc.), which is a separate decision.
+
 ## Endpoints
 
 - `GET /` — chat UI (`static/index.html`)
@@ -138,5 +229,4 @@ How it works (`service.py`):
 ## Roadmap
 
 - Payment integration (not yet implemented)
-- pytest test suite covering the verify/retry/regret and cooking retry/refund paths
-- More agentic routing: let the LLM ask a clarifying question on ambiguous input instead of defaulting to `SHOW_MENU`
+- HTTP-layer tests for `service.py` (session lifecycle, 404/409 handling) — the current suite tests `agent.py`'s graph nodes directly

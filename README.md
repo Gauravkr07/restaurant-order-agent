@@ -249,6 +249,16 @@ docker run -p 8000:8000 \
 
   Response shape: `session_id`, `reply`, `status`, `cart`, `order`, `cooking_duration` (set once cooking has started). An unrecognized `session_id` returns `404`; a `session_id` whose conversation has ended (`status = "regretted"`) returns `409` — start a new session (omit `session_id`) to order again.
 
+- `POST /checkout` — idempotent checkout, separate from the chat flow. Requires an `Idempotency-Key` header:
+
+  ```bash
+  curl -X POST http://localhost:8000/checkout \
+    -H "Idempotency-Key: <client-generated-key>" \
+    -d '{"session_id": "..."}'
+  ```
+
+  Calling this more than once with the **same key** (e.g. three rapid "PAY" clicks) returns the **same order** every time (`created: false` on repeats) instead of creating duplicates — enforced by a UNIQUE `idempotency_key` column, a `SELECT ... FOR UPDATE` row lock on the cart, and a Redis distributed lock. On a genuinely new order, a Celery task fans out four follow-up actions in parallel (`send_confirmation`, `notify_restaurant`, `generate_invoice`, `update_delivery_status` — currently stubs, no real integrations yet); replays never re-trigger these. Requires the `celery-worker` service (`docker compose up` starts it automatically).
+
 ## Roadmap
 
 - Payment integration (not yet implemented)

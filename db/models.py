@@ -88,6 +88,16 @@ class Order(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
     status: Mapped[str] = mapped_column(String(20), default="ordered", index=True)
+    # UNIQUE, not just indexed: this is what makes a repeated checkout with
+    # the same key a no-op at the database level, even under concurrent
+    # requests - a second INSERT with the same key raises IntegrityError
+    # rather than silently succeeding. Nullable because not every order
+    # is created through the idempotent /checkout endpoint (the chat-based
+    # checkout node doesn't use one).
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True, index=True)
+    # Optimistic concurrency: incremented on every update; update_order_status
+    # etc. check it hasn't moved since they read it (see repository.py).
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 

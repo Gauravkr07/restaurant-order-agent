@@ -9,3 +9,4 @@ redis
 sqlalchemy
 alembic
 psycopg[binary]
+celery

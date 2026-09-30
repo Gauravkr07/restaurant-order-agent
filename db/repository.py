@@ -9,11 +9,17 @@ touch a detached ORM instance after its session has closed.
 """
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 
 from db.base import SessionLocal
 from db.models import Cart, CartItem, MenuItem, Order, OrderItem, Session
+
+
+class ConcurrentUpdateError(Exception):
+    """Raised when an optimistic-concurrency write loses a race: the
+    row's `version` had already moved since the caller read it."""
 
 
 # ---- Menu -------------------------------------------------------------
@@ -224,44 +230,145 @@ def create_order_from_cart(session_id: str) -> dict | None:
         return {"order_id": order.id, "status": order.status, "items": items_snapshot}
 
 
+def create_order_idempotent(session_id: str, idempotency_key: str) -> tuple[dict | None, bool]:
+    """Like create_order_from_cart, but safe to call more than once with
+    the same idempotency_key: the first call creates the order, every
+    later call with the same key returns that SAME order instead of
+    creating a new one - e.g. a customer's three rapid "PAY" clicks
+    produce exactly one order.
+
+    Returns (order_dict_or_None, created) - created is False when an
+    existing order was returned instead of a new one being made.
+
+    Two layers of protection, in order:
+    1. Look up by idempotency_key first (fast path - covers the common
+       case of a genuine retry after the first request already
+       succeeded and committed).
+    2. `SELECT ... FOR UPDATE` on the cart row before reading/clearing
+       it, so two requests that both miss the step-1 lookup (because
+       they're running concurrently, before either has committed) can't
+       both read the same cart and both try to empty it - the second
+       request blocks until the first's transaction commits or rolls
+       back, then re-checks.
+    If both of those somehow still race (e.g. two different session
+    rows racing to insert the same externally-supplied key), the
+    UNIQUE constraint on idempotency_key is the final backstop: the
+    losing INSERT raises IntegrityError, caught here, falling back to
+    the step-1 lookup.
+    """
+    existing = _get_order_by_idempotency_key(idempotency_key)
+    if existing is not None:
+        return existing, False
+
+    with SessionLocal() as db:
+        cart = db.scalar(
+            select(Cart).where(Cart.session_id == session_id).with_for_update()
+        )
+        if cart is None or not cart.items:
+            return None, False
+
+        order = Order(session_id=session_id, status="ordered", idempotency_key=idempotency_key)
+        db.add(order)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            existing = _get_order_by_idempotency_key(idempotency_key)
+            assert existing is not None, "unique violation but no matching order found"
+            return existing, False
+
+        items_snapshot = []
+        for cart_item in cart.items:
+            order_item = OrderItem(
+                order_id=order.id,
+                menu_item_id=cart_item.menu_item_id,
+                quantity=cart_item.quantity,
+                price_at_order=cart_item.menu_item.price,
+            )
+            db.add(order_item)
+            items_snapshot.append(
+                {
+                    "item": cart_item.menu_item.name,
+                    "quantity": cart_item.quantity,
+                    "price": float(cart_item.menu_item.price),
+                }
+            )
+            db.delete(cart_item)
+
+        db.commit()
+        db.refresh(order)
+        return _order_to_dict(order), True
+
+
+def _get_order_by_idempotency_key(idempotency_key: str) -> dict | None:
+    with SessionLocal() as db:
+        order = db.scalar(select(Order).where(Order.idempotency_key == idempotency_key))
+        return _order_to_dict(order) if order else None
+
+
 def get_order(order_id: int) -> dict | None:
     with SessionLocal() as db:
         order = db.get(Order, order_id)
         if order is None:
             return None
-        return {
-            "order_id": order.id,
-            "status": order.status,
-            "items": [
-                {
-                    "item": oi.menu_item.name,
-                    "quantity": oi.quantity,
-                    "price": float(oi.price_at_order),
-                }
-                for oi in order.items
-            ],
-        }
+        return _order_to_dict(order)
 
 
-def cancel_order(order_id: int) -> dict | None:
+def _order_to_dict(order: Order) -> dict:
+    return {
+        "order_id": order.id,
+        "status": order.status,
+        "version": order.version,
+        "items": [
+            {
+                "item": oi.menu_item.name,
+                "quantity": oi.quantity,
+                "price": float(oi.price_at_order),
+            }
+            for oi in order.items
+        ],
+    }
+
+
+def cancel_order(order_id: int, expected_version: int | None = None) -> dict | None:
     """Only valid before cooking has started - once status is "cooking"
-    or later, use the refund path in cooking_stage instead."""
+    or later, use the refund path in cooking_stage instead.
+
+    If expected_version is given, this is an optimistic-concurrency
+    write: the UPDATE only applies WHERE version = expected_version, so
+    if another request already changed the order in between the caller
+    reading it and calling this, zero rows match and
+    ConcurrentUpdateError is raised instead of silently overwriting
+    that other change."""
     with SessionLocal() as db:
         order = db.get(Order, order_id)
         if order is None or order.status not in ("ordered",):
             return None
+        if expected_version is not None and order.version != expected_version:
+            raise ConcurrentUpdateError(
+                f"order {order_id} version is {order.version}, expected {expected_version}"
+            )
         order.status = "cancelled"
+        order.version += 1
         order.updated_at = datetime.now(timezone.utc)
         db.commit()
-        return get_order(order_id)
+        db.refresh(order)
+        return _order_to_dict(order)
 
 
-def update_order_status(order_id: int, status: str) -> dict | None:
+def update_order_status(order_id: int, status: str, expected_version: int | None = None) -> dict | None:
+    """See cancel_order's docstring for what expected_version does."""
     with SessionLocal() as db:
         order = db.get(Order, order_id)
         if order is None:
             return None
+        if expected_version is not None and order.version != expected_version:
+            raise ConcurrentUpdateError(
+                f"order {order_id} version is {order.version}, expected {expected_version}"
+            )
         order.status = status
+        order.version += 1
         order.updated_at = datetime.now(timezone.utc)
         db.commit()
-        return get_order(order_id)
+        db.refresh(order)
+        return _order_to_dict(order)

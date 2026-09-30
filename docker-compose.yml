@@ -44,6 +44,18 @@ services:
       postgres:
         condition: service_healthy
 
+  celery-worker:
+    build: .
+    command: celery -A tasks.celery_app worker --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql+psycopg://restaurant:restaurant@postgres:5432/restaurant_order_agent
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
 volumes:
   redis-data:
   postgres-data:

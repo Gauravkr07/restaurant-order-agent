@@ -20,15 +20,17 @@ from typing import Any
 
 import groq
 import redis
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, ValidationError
+from redis.exceptions import LockError
 
 import agent
 from db import repository
 from helpers.logging_config import current_session_id, get_logger
+from tasks.order_tasks import process_completed_order
 
 logger = get_logger(__name__)
 
@@ -235,6 +237,82 @@ def chat(req: ChatRequest) -> ChatResponse:
         order=order,
         order_id=counters["order_id"],
         cooking_duration=result.get("cooking_duration"),
+    )
+
+
+# --- idempotent checkout (Phase 7) ---
+# Standalone endpoint, separate from the chat-based checkout in
+# agent.py's checkout node: this is the literal "POST /checkout with an
+# Idempotency-Key header" contract, for a client (e.g. a "Pay" button)
+# that can generate and resend the same key on retry/double-click.
+
+CHECKOUT_LOCK_TIMEOUT_SECONDS = 10  # max time a checkout can hold the lock
+CHECKOUT_LOCK_WAIT_SECONDS = 8  # how long a second request waits for the first
+
+
+class CheckoutRequest(BaseModel):
+    session_id: str
+
+
+class CheckoutResponse(BaseModel):
+    order_id: int
+    status: str
+    items: list[dict]
+    created: bool  # False if this returned an existing order (idempotent replay)
+
+
+@app.post("/checkout")
+def checkout_endpoint(
+    req: CheckoutRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+) -> CheckoutResponse:
+    current_session_id.set(req.session_id)
+    if repository.get_session(req.session_id) is None:
+        raise HTTPException(status_code=404, detail="Unknown session_id")
+
+    # Redis distributed lock: the DB-level protections (idempotency_key
+    # UNIQUE constraint + SELECT ... FOR UPDATE on the cart row) are what
+    # actually guarantee correctness even without this lock - it exists
+    # to fail fast and avoid making two concurrent requests both sit
+    # blocked on the same Postgres row lock for no reason, and to give a
+    # clear timeout/error if something is stuck.
+    lock = redis_client.lock(
+        f"checkout-lock:{idempotency_key}",
+        timeout=CHECKOUT_LOCK_TIMEOUT_SECONDS,
+        blocking_timeout=CHECKOUT_LOCK_WAIT_SECONDS,
+    )
+    acquired = lock.acquire(blocking=True)
+    if not acquired:
+        logger.warning("checkout_lock_timeout", extra={"idempotency_key": idempotency_key})
+        raise HTTPException(
+            status_code=409,
+            detail="Another checkout with this Idempotency-Key is already in progress. Please retry shortly.",
+        )
+    try:
+        order, created = repository.create_order_idempotent(req.session_id, idempotency_key)
+    finally:
+        try:
+            lock.release()
+        except LockError:
+            pass  # lock already expired (timeout) - fine, nothing to release
+
+    if order is None:
+        raise HTTPException(status_code=400, detail="Cart is empty - nothing to check out.")
+
+    logger.info(
+        "checkout_endpoint_result",
+        extra={"order_id": order["order_id"], "was_created": created, "idempotency_key": idempotency_key},
+    )
+    if created:
+        # Only fan out on a genuinely new order - an idempotent replay
+        # (created=False) must NOT re-send confirmations/invoices, or
+        # the customer's three "PAY" clicks would produce three emails.
+        process_completed_order.delay(order["order_id"])
+    return CheckoutResponse(
+        order_id=order["order_id"],
+        status=order["status"],
+        items=order["items"],
+        created=created,
     )
 
 

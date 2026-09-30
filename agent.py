@@ -8,7 +8,7 @@ from langgraph.graph import StateGraph, START, END
 from pydantic import ValidationError
 from typing import Literal
 
-from agent_tools import add_to_cart, get_menu_item, search_menu
+from agent_tools import add_to_cart, checkout as checkout_tool, get_cart, get_menu_item, remove_from_cart, search_menu
 from db import repository
 from helpers.llm import llm
 from helpers.logging_config import get_logger
@@ -96,6 +96,43 @@ def extract_requested_items(human_message: str, system_prompt: str) -> Requested
     raise last_error
 
 
+def run_tool_loop(tools: list, system_prompt: str, user_message: str, on_tool_call=None) -> str:
+    """Shared tool-calling loop: the LLM is bound to `tools` and decides
+    itself which to call and when (call tool -> see result -> call
+    another tool or finish), up to MAX_TOOL_CALL_ROUNDS. `on_tool_call`,
+    if given, is called with (tool_name, tool_args) after each successful
+    tool call - used to build a structured record of what happened
+    without relying on the model to report it accurately in prose.
+
+    Returns the final plain-text message once the model stops calling
+    tools. Callers that need structured data out of that summary should
+    run a SEPARATE, tool-free structured-output call on it (see
+    extract_unavailable_items) rather than asking for structured output
+    in this same context - mixing tool-call history with a structured-
+    output request is what triggers Groq's "Tool choice is required, but
+    model did not call a tool" error.
+    """
+    tool_llm = llm.bind_tools(tools)
+    messages = [("system", system_prompt), ("human", user_message)]
+
+    ai_message = None
+    for _ in range(MAX_TOOL_CALL_ROUNDS):
+        ai_message = tool_llm.invoke(messages)
+        messages.append(ai_message)
+        if not ai_message.tool_calls:
+            break
+        for call in ai_message.tool_calls:
+            tool = next(t for t in tools if t.name == call["name"])
+            result = tool.invoke(call["args"])
+            if on_tool_call is not None:
+                on_tool_call(call["name"], call["args"])
+            messages.append(ToolMessage(content=json.dumps(result, default=str), tool_call_id=call["id"]))
+    else:
+        logger.warning("tool_loop_max_rounds_reached", extra={"rounds": MAX_TOOL_CALL_ROUNDS})
+
+    return ai_message.content if isinstance(ai_message.content, str) else str(ai_message.content)
+
+
 ADD_ITEM_TOOLS = [search_menu, get_menu_item, add_to_cart]
 
 
@@ -103,13 +140,10 @@ def run_add_item_agent(session_id: str, user_message: str) -> AddItemVerdict:
     """Phase 2 tool-based agent: instead of extracting structured items
     and checking stock in Python, the LLM is given search_menu/
     get_menu_item/add_to_cart directly and decides itself which to call
-    and when, in a loop (call tool -> see result -> call another tool or
-    finish). It's told explicitly to only call add_to_cart for items it
-    has confirmed are in stock. Once the loop ends, a second structured-
-    output call turns the conversation into an AddItemVerdict so
-    verify_items gets reliable structured data instead of parsed prose.
+    and when. It's told explicitly to only call add_to_cart for items it
+    has confirmed are in stock. A second structured-output call turns
+    the loop's final summary into an AddItemVerdict.
     """
-    tool_llm = llm.bind_tools(ADD_ITEM_TOOLS)
     system_prompt = (
         "You are a restaurant ordering assistant with tools to look up "
         "the menu and add items to a cart. The customer's session_id is "
@@ -126,26 +160,44 @@ def run_add_item_agent(session_id: str, user_message: str) -> AddItemVerdict:
         "stock, with the actual available quantity if you know it)."
         + UNTRUSTED_INPUT_NOTICE
     )
-    messages = [("system", system_prompt), ("human", user_message)]
 
     added: list[RequestedItem] = []
-    for _ in range(MAX_TOOL_CALL_ROUNDS):
-        ai_message = tool_llm.invoke(messages)
-        messages.append(ai_message)
-        if not ai_message.tool_calls:
-            break
-        for call in ai_message.tool_calls:
-            tool = next(t for t in ADD_ITEM_TOOLS if t.name == call["name"])
-            result = tool.invoke(call["args"])
-            if call["name"] == "add_to_cart":
-                added.append(RequestedItem(item=call["args"]["item_name"], quantity=call["args"]["quantity"]))
-            messages.append(ToolMessage(content=json.dumps(result, default=str), tool_call_id=call["id"]))
-    else:
-        logger.warning("add_item_agent_max_rounds_reached", extra={"rounds": MAX_TOOL_CALL_ROUNDS})
 
-    final_summary = ai_message.content if isinstance(ai_message.content, str) else str(ai_message.content)
+    def track_add(tool_name, tool_args):
+        if tool_name == "add_to_cart":
+            added.append(RequestedItem(item=tool_args["item_name"], quantity=tool_args["quantity"]))
+
+    final_summary = run_tool_loop(ADD_ITEM_TOOLS, system_prompt, user_message, on_tool_call=track_add)
     unavailable = extract_unavailable_items(final_summary)
     return AddItemVerdict(added=added, unavailable=unavailable)
+
+
+REMOVE_ITEM_TOOLS = [remove_from_cart, get_cart]
+
+
+def run_remove_item_agent(session_id: str, user_message: str) -> str:
+    """Phase 3 tool-based agent for the remove-item flow: the LLM is
+    given remove_from_cart/get_cart and decides itself what to remove,
+    instead of a hardcoded extract-then-remove pipeline. Returns the
+    model's final plain-text summary directly as the customer reply -
+    no further structured extraction is needed here since remove_item
+    has no branching business logic left to drive (unlike verify_items'
+    3-strike regret path).
+    """
+    system_prompt = (
+        "You are a restaurant assistant with tools to view and remove "
+        "items from a customer's cart. The customer's session_id is "
+        f'"{session_id}" - pass it to any tool that takes one.\n\n'
+        "For each item the customer wants removed, call remove_from_cart "
+        "with the item name and quantity they specified. If you're unsure "
+        "what's in the cart, call get_cart first.\n\n"
+        "When you are done, reply with a short plain-text confirmation of "
+        "what was removed or updated, and mention anything that couldn't "
+        "be removed (not in cart, or asked for more than was in the cart) "
+        "based on each tool call's result."
+        + UNTRUSTED_INPUT_NOTICE
+    )
+    return run_tool_loop(REMOVE_ITEM_TOOLS, system_prompt, f"remove item {user_message}")
 
 
 def extract_unavailable_items(summary_text: str) -> list[UnavailableItem]:
@@ -381,54 +433,23 @@ def view_cart(state: State) -> dict:
     return {"unclear_count": 0, "messages": [response]}
 
 
-def remove_item(state: State):
+def remove_item(state: State) -> dict:
+    """Phase 3 tool-based node: run_remove_item_agent lets the LLM decide
+    what to remove via remove_from_cart/get_cart, instead of a hardcoded
+    extract-then-remove pipeline."""
     logger.info("node_remove_item")
     session_id = state["session_id"]
     user_input = state["messages"][-1].content
-    response = extract_requested_items(
-        f"remove item{user_input}",
-        """
-You are a restaurant assistant.,
-Tasks:
-Extract food items and quantities.
-Return structured output only.
-""",
-    )
-    result_messages = []
-    for requested_item in response.items:
-        outcome = repository.remove_cart_item(session_id, requested_item.item, requested_item.quantity)
-        if outcome == "not_in_cart":
-            result_messages.append(f"{requested_item.item} is not in cart.")
-        elif outcome == "insufficient":
-            current_qty = repository.get_cart_item_quantity(session_id, requested_item.item)
-            result_messages.append(f"Only {current_qty} {requested_item.item} available in cart.")
-        elif outcome == "removed":
-            result_messages.append(f"{requested_item.item} removed from cart.")
-        else:
-            new_qty = repository.get_cart_item_quantity(session_id, requested_item.item)
-            result_messages.append(f"{requested_item.item} quantity updated to {new_qty}.")
-
-    if not result_messages:
-        response = llm.invoke([
-            ("system", "You are a polite restaurant assistant."),
-            ("human", "The customer tried to remove something from their "
-                      "cart, but no valid item or quantity could be "
-                      "understood. Politely ask them to specify what they'd "
-                      "like to remove, e.g. \"remove 1 pizza\"."),
-        ])
-        return {
-            "unclear_count": 0,
-            "messages": [response],
-        }
-    return {
-        "unclear_count": 0,
-        "messages": result_messages
-    }
+    summary = run_remove_item_agent(session_id, user_input)
+    return {"unclear_count": 0, "messages": [("ai", summary)]}
 
 
 def checkout(state: State) -> dict:
+    """Deterministic single action (create an order from the cart) - no
+    decision-making needed, so this calls the checkout tool directly
+    rather than running a full tool-calling loop for it."""
     logger.info("node_checkout")
-    order = repository.create_order_from_cart(state["session_id"])
+    order = checkout_tool.invoke({"session_id": state["session_id"]})
     if order is None:
         response = llm.invoke([
             ("system", "You are a polite restaurant assistant."),

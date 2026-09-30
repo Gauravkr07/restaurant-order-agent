@@ -8,7 +8,17 @@ from langgraph.graph import StateGraph, START, END
 from pydantic import ValidationError
 from typing import Literal
 
-from agent_tools import add_to_cart, checkout as checkout_tool, get_cart, get_menu_item, remove_from_cart, search_menu
+from agent_tools import (
+    add_to_cart,
+    cancel_order,
+    checkout as checkout_tool,
+    get_cart,
+    get_menu_item,
+    get_order_status,
+    remove_from_cart,
+    request_refund_for_order,
+    search_menu,
+)
 from db import repository
 from helpers.llm import llm
 from helpers.logging_config import get_logger
@@ -200,6 +210,38 @@ def run_remove_item_agent(session_id: str, user_message: str) -> str:
     return run_tool_loop(REMOVE_ITEM_TOOLS, system_prompt, f"remove item {user_message}")
 
 
+ORDER_HELP_TOOLS = [get_order_status, request_refund_for_order, cancel_order]
+
+
+def run_order_help_agent(user_message: str) -> str:
+    """Handles anything about an EXISTING order by number - checking its
+    status, requesting a refund, or cancelling it (not the current
+    cart/checkout - that's verify_items/checkout). No session_id needed
+    here since these tools only take an order_id, which the customer
+    must state themselves (there's no login linking a session to a
+    history of past orders yet)."""
+    system_prompt = (
+        "You are a restaurant assistant with tools to look up, refund, "
+        "or cancel an EXISTING order by its order number.\n\n"
+        "If the customer gives an order number, call get_order_status "
+        "first to see its current state. If they're asking for a "
+        "refund, call request_refund_for_order - only do this for an "
+        "order that's actually delivered or failed (get_order_status "
+        "tells you the status first). If they want to cancel and the "
+        "order hasn't started cooking yet, call cancel_order instead - "
+        "explain a refund isn't the right tool if cooking has already "
+        "started (point them to the refund flow instead). If they "
+        "didn't give an order number, ask for one - don't guess it.\n\n"
+        "When you are done, reply with a short, clear plain-text "
+        "summary of what you found or did. If a refund needs human "
+        "approval (request_refund_for_order returns status "
+        "\"pending_refund_approval\"), say so plainly and that it will "
+        "be reviewed shortly - don't imply it's instant."
+        + UNTRUSTED_INPUT_NOTICE
+    )
+    return run_tool_loop(ORDER_HELP_TOOLS, system_prompt, user_message)
+
+
 def extract_unavailable_items(summary_text: str) -> list[UnavailableItem]:
     """A fresh, tool-free structured-output call (no tool-call/tool-result
     history in context) that pulls the unavailable items and reasons out
@@ -258,6 +300,7 @@ def route_intent(
     "VIEW_CART",
     "CHECKOUT",
     "COOKING_STAGE",
+    "ORDER_HELP",
     "CLARIFY",
 ]:
     if state.get("status") == "cooking_retry":
@@ -278,7 +321,12 @@ ADD_ITEM
 REMOVE_ITEM
 VIEW_CART
 CHECKOUT
+ORDER_HELP
 UNCLEAR
+
+ORDER_HELP is for anything about an EXISTING order by number - checking
+its status/tracking it, or asking for a refund/cancellation on it. Not
+for the current cart/checkout.
 
 Use UNCLEAR only if the message genuinely does not map to any of the
 other intents (e.g. small talk, a question you can't answer from intent
@@ -298,6 +346,7 @@ Do not add punctuation or explanation."""),
         "REMOVE_ITEM",
         "VIEW_CART",
         "CHECKOUT",
+        "ORDER_HELP",
         "UNCLEAR",
     }
     if intent not in allowed_intents:
@@ -441,6 +490,17 @@ def remove_item(state: State) -> dict:
     session_id = state["session_id"]
     user_input = state["messages"][-1].content
     summary = run_remove_item_agent(session_id, user_input)
+    return {"unclear_count": 0, "messages": [("ai", summary)]}
+
+
+def order_help(state: State) -> dict:
+    """Order tracking, refund requests, and cancellation for an EXISTING
+    order by number - the customer states the order id themselves,
+    since there's no login linking a session to their past order
+    history yet."""
+    logger.info("node_order_help")
+    user_message = state["messages"][-1].content
+    summary = run_order_help_agent(user_message)
     return {"unclear_count": 0, "messages": [("ai", summary)]}
 
 
@@ -595,6 +655,7 @@ builder.add_node("checkout", checkout)
 builder.add_node("cooking_stage", cooking_stage)
 builder.add_node("delivery", delivery)
 builder.add_node("clarify", clarify)
+builder.add_node("order_help", order_help)
 
 builder.add_conditional_edges(
     START,
@@ -606,6 +667,7 @@ builder.add_conditional_edges(
         "VIEW_CART": "view_cart",
         "CHECKOUT": "checkout",
         "COOKING_STAGE": "cooking_stage",
+        "ORDER_HELP": "order_help",
         "CLARIFY": "clarify",
     }
 )
@@ -614,6 +676,7 @@ builder.add_edge("verify_items", END)
 builder.add_edge("remove_item", END)
 builder.add_edge("view_cart", END)
 builder.add_edge("clarify", END)
+builder.add_edge("order_help", END)
 builder.add_conditional_edges(
     "checkout",
     route_after_checkout,

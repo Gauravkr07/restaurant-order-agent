@@ -149,6 +149,24 @@ def get_menu() -> list[dict]:
     return repository.get_active_menu_items()
 
 
+class OrderStatusResponse(BaseModel):
+    order_id: int
+    status: str
+    items: list[dict]
+
+
+@app.get("/orders/{order_id}")
+def get_order_endpoint(order_id: int) -> OrderStatusResponse:
+    """Public order tracking - no auth/session check, same as the rest
+    of this app (no real accounts exist yet). Anyone with the order
+    number can look it up, matching how most small delivery apps let
+    you "track" an order by number alone."""
+    order = repository.get_order(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="No order with that id.")
+    return OrderStatusResponse(order_id=order["order_id"], status=order["status"], items=order["items"])
+
+
 @app.post("/chat")
 def chat(req: ChatRequest) -> ChatResponse:
     start_time = time.monotonic()

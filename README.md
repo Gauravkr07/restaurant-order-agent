@@ -267,7 +267,13 @@ docker run -p 8000:8000 \
     -d '{"session_id": "..."}'
   ```
 
-  Calling this more than once with the **same key** (e.g. three rapid "PAY" clicks) returns the **same order** every time (`created: false` on repeats) instead of creating duplicates — enforced by a UNIQUE `idempotency_key` column, a `SELECT ... FOR UPDATE` row lock on the cart, and a Redis distributed lock. On a genuinely new order, a Celery task fans out four follow-up actions in parallel (`send_confirmation`, `notify_restaurant`, `generate_invoice`, `update_delivery_status` — currently stubs, no real integrations yet); replays never re-trigger these. Requires the `celery-worker` service (`docker compose up` starts it automatically).
+  Calling this more than once with the **same key** (e.g. three rapid "PAY" clicks) returns the **same order** every time (`created: false` on repeats) instead of creating duplicates — enforced by a UNIQUE `idempotency_key` column, a `SELECT ... FOR UPDATE` row lock on the cart, and a Redis distributed lock. On a genuinely new order, a Celery task fans out four follow-up actions in parallel (`send_confirmation`, `notify_restaurant`, `generate_invoice`, `update_delivery_status` — currently stubs, no real integrations yet); replays never re-trigger these. Requires the `celery-worker` service (`docker compose up` starts it automatically). The chat UI's Checkout button calls this endpoint directly (see `static/index.html`), not `/chat`.
+
+- `GET /orders/{order_id}` — public order tracking by order number (no auth — same as the rest of this app). Returns `{order_id, status, items}`, `404` if the order doesn't exist. The chat UI has a "Track order" box that calls this directly.
+
+- `POST /orders/{order_id}/approve-refund` / `POST /orders/{order_id}/reject-refund` — resolve a refund parked at `pending_refund_approval` (order total over ₹10,000 — see [Data layer](#data-layer)). No admin UI yet; call these directly. `404` if the order isn't currently awaiting approval.
+
+Customers can also ask about an existing order **conversationally** through `/chat` — "what's the status of order 16?", "I'd like a refund for order 17", "cancel order 16" all route to a tool-calling flow (`get_order_status` / `request_refund_for_order` / `cancel_order`) rather than a fixed endpoint call, same pattern as ordering/cart management.
 
 ## Roadmap
 

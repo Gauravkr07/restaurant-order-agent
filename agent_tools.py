@@ -85,6 +85,22 @@ def get_order_status(order_id: int) -> dict | None:
     return repository.get_order(order_id)
 
 
+@tool
+def request_refund_for_order(order_id: int) -> dict | None:
+    """Request a refund for an order that has already been delivered
+    (or one that failed during cooking). Returns None if the order id
+    doesn't exist or isn't in a refundable state (e.g. it's still
+    cooking - use cancel_order for an order that hasn't started cooking
+    yet - or a refund was already requested/resolved for it).
+
+    Refunds up to ₹10,000 are approved immediately (returned status:
+    "refunded"). Larger refunds need a human to review them first
+    (returned status: "pending_refund_approval") - tell the customer
+    it's being reviewed and will be handled shortly, don't imply it's
+    instant."""
+    return repository.request_refund(order_id)
+
+
 ALL_TOOLS = [
     search_menu,
     get_menu_item,
@@ -94,4 +110,5 @@ ALL_TOOLS = [
     checkout,
     cancel_order,
     get_order_status,
+    request_refund_for_order,
 ]

@@ -128,6 +128,13 @@ class FakeRepository:
     def get_order(self, order_id):
         return self.orders.get(order_id)
 
+    def cancel_order(self, order_id):
+        order = self.orders.get(order_id)
+        if order is None or order["status"] != "ordered":
+            return None
+        order["status"] = "cancelled"
+        return order
+
     def update_order_status(self, order_id, status):
         order = self.orders.get(order_id)
         if order is None:
@@ -142,9 +149,10 @@ class FakeRepository:
         return sum(i["price"] * i["quantity"] for i in order["items"])
 
     def request_refund(self, order_id):
-        total = self.get_order_total(order_id)
-        if total is None:
+        order = self.orders.get(order_id)
+        if order is None or order["status"] not in ("ordered", "delivered"):
             return None
+        total = self.get_order_total(order_id)
         status = "pending_refund_approval" if total > 10_000 else "refunded"
         return self.update_order_status(order_id, status)
 

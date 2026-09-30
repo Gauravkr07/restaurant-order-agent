@@ -145,6 +145,11 @@
 
   <div id="messages"></div>
 
+  <div id="track-order" style="display:flex; gap:8px; padding:0 20px 12px;">
+    <input id="track-order-input" type="number" min="1" placeholder="Order # to track" style="flex:1; padding:8px 12px; border:1px solid var(--border); border-radius:999px; font-size:13px;" />
+    <button type="button" id="track-order-btn" class="secondary">Track</button>
+  </div>
+
   <div class="quick-actions">
     <button type="button" data-msg="show me the menu">Show menu</button>
     <button type="button" data-msg="show my cart">View cart</button>
@@ -318,6 +323,45 @@
 
   const checkoutBtn = document.getElementById("checkout-btn");
   checkoutBtn.addEventListener("click", checkout);
+
+  async function trackOrder() {
+    const orderIdInput = document.getElementById("track-order-input");
+    const orderId = orderIdInput.value.trim();
+    if (!orderId) return;
+
+    addMessage("track order #" + orderId, "user");
+    const pending = addMessage("...", "bot pending");
+    const trackBtn = document.getElementById("track-order-btn");
+    trackBtn.disabled = true;
+
+    try {
+      const res = await fetch(API_BASE + "/orders/" + encodeURIComponent(orderId));
+      if (!res.ok) {
+        let detail = "Something went wrong (" + res.status + ").";
+        try {
+          const errBody = await res.json();
+          if (errBody && errBody.detail) detail = errBody.detail;
+        } catch (e) {}
+        pending.remove();
+        addMessage(detail, "error");
+        return;
+      }
+      const data = await res.json();
+      pending.remove();
+      const itemsText = data.items.map((i) => i.quantity + " x " + i.item).join(", ");
+      addMessage("Order #" + data.order_id + " — status: " + data.status + "\n" + itemsText, "bot");
+    } catch (err) {
+      pending.remove();
+      addMessage("Could not reach the server. Is it running?", "error");
+    } finally {
+      trackBtn.disabled = false;
+    }
+  }
+
+  document.getElementById("track-order-btn").addEventListener("click", trackOrder);
+  document.getElementById("track-order-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); trackOrder(); }
+  });
 
   resetBtn.addEventListener("click", () => {
     sessionId = null;

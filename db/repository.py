@@ -393,8 +393,24 @@ def get_order_total(order_id: int) -> float | None:
         return sum(float(oi.price_at_order) * oi.quantity for oi in order.items)
 
 
+# Orders in these statuses can have a refund requested against them:
+# - "ordered": cooking_stage's own call, when cooking has permanently
+#   failed (the order's DB status is still "ordered" at that point -
+#   "regretted" only ever exists as the session/conversation status,
+#   set separately in agent.py's State, not written to orders.status).
+# - "delivered": a customer asking for a refund after the fact via chat.
+# Already-"refunded"/"pending_refund_approval"/"refund_rejected"/
+# "cancelled" orders are excluded so a refund can't be requested twice.
+REFUNDABLE_STATUSES = ("ordered", "delivered")
+
+
 def request_refund(order_id: int) -> dict | None:
-    """Called when cooking has permanently failed and a refund is owed.
+    """Called either when cooking has permanently failed (cooking_stage)
+    or when a customer asks for a refund on a delivered order (the
+    request_refund_for_order tool, via chat). Returns None if the order
+    doesn't exist or isn't in a refundable status - see
+    REFUNDABLE_STATUSES.
+
     Small refunds (<= REFUND_APPROVAL_THRESHOLD) are auto-approved
     immediately (status -> "refunded"). Large refunds instead pause at
     status "pending_refund_approval" until a human calls approve_refund
@@ -404,6 +420,10 @@ def request_refund(order_id: int) -> dict | None:
     the order sits in this status rather than the conversation itself
     being suspended (see prompt_implementation.md for why this app uses
     an application-level pause instead of a LangGraph checkpointer)."""
+    with SessionLocal() as db:
+        order = db.get(Order, order_id)
+        if order is None or order.status not in REFUNDABLE_STATUSES:
+            return None
     total = get_order_total(order_id)
     if total is None:
         return None

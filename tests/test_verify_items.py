@@ -12,7 +12,7 @@ def _state(base_state, message, query_count=0):
     }
 
 
-def test_all_items_available_moves_to_cart(fake_llm, base_state):
+def test_all_items_available_moves_to_cart(fake_llm, fake_repository, base_state):
     fake_llm.extraction_result = RequestedItems(
         items=[RequestedItem(item="pizza", quantity=2)]
     )
@@ -22,7 +22,7 @@ def test_all_items_available_moves_to_cart(fake_llm, base_state):
     assert result["unclear_count"] == 0
 
 
-def test_partial_availability_asks_user_and_increments_query_count(fake_llm, base_state):
+def test_partial_availability_asks_user_and_increments_query_count(fake_llm, fake_repository, base_state):
     fake_llm.extraction_result = RequestedItems(
         items=[RequestedItem(item="pizza", quantity=30)]  # pizza stock is 20
     )
@@ -32,7 +32,7 @@ def test_partial_availability_asks_user_and_increments_query_count(fake_llm, bas
     assert result["messages"]
 
 
-def test_third_failed_attempt_regrets(fake_llm, base_state):
+def test_third_failed_attempt_regrets(fake_llm, fake_repository, base_state):
     fake_llm.extraction_result = RequestedItems(
         items=[RequestedItem(item="pizza", quantity=30)]  # pizza stock is 20
     )
@@ -44,7 +44,7 @@ def test_third_failed_attempt_regrets(fake_llm, base_state):
     assert result["messages"]
 
 
-def test_item_not_on_menu_is_treated_as_unavailable(fake_llm, base_state):
+def test_item_not_on_menu_is_treated_as_unavailable(fake_llm, fake_repository, base_state):
     fake_llm.extraction_result = RequestedItems(
         items=[RequestedItem(item="lobster thermidor", quantity=1)]
     )

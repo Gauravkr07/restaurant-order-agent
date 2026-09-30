@@ -1,17 +1,10 @@
 """
 Restaurant Agent Service
 -------------------------
-A thin FastAPI service that exposes the LangGraph restaurant agent
-(defined in agent.py) over HTTP. agent.py is imported as-is and is
-not modified by this file.
-
-The graph is stateful across turns (status, query_count, cook_retry_count,
-cart, order), but that state lives on the server, not the client. /chat
-takes a session_id: on the first call omit it and one is generated and
-returned; on every later call pass it back and the server resumes the
-conversation from wherever it left off. The client never sees or sends
-query_count/cook_retry_count/status/cart/order directly - it only ever
-sends a message.
+FastAPI layer wrapping agent.py. Redis holds only per-turn session
+counters (status, query_count, cook_retry_count, unclear_count,
+turn_count) - cart/order data lives in Postgres via db/repository.py,
+which is the actual source of truth (see README "Data layer").
 
 Endpoints:
   GET  /            - simple browser chat UI (static/index.html)
@@ -34,6 +27,7 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, ValidationError
 
 import agent
+from db import repository
 from helpers.logging_config import current_session_id, get_logger
 
 logger = get_logger(__name__)
@@ -100,49 +94,31 @@ def handle_validation_error(request: Request, exc: ValidationError) -> JSONRespo
         content={"detail": "Couldn't understand the quantity or item in that message — try rephrasing (e.g. \"2 pizzas\")."},
     )
 
-# --- conversation state, keyed by session_id, persisted in Redis ---
-# (Redis only stores strings, so state is JSON-encoded on write and
-# JSON-decoded on read. Cart/Order are Pydantic models, so they're
-# converted to plain dicts with .model_dump() before encoding, and
-# rebuilt with Cart(**...)/Order(**...) after decoding.)
+
+# --- session counters, keyed by session_id, persisted in Redis ---
 
 def _session_key(session_id: str) -> str:
     return f"session:{session_id}"
 
 
-def _new_session_state() -> dict[str, Any]:
+def _new_session_counters() -> dict[str, Any]:
     return {
         "status": "browsing",
         "query_count": 0,
         "cook_retry_count": 0,
         "unclear_count": 0,
         "turn_count": 0,
-        "cart": [],
-        "order": None,
+        "order_id": None,
     }
 
 
-def _load_session(session_id: str) -> dict[str, Any] | None:
+def _load_session_counters(session_id: str) -> dict[str, Any] | None:
     raw = redis_client.get(_session_key(session_id))
-    if raw is None:
-        return None
-    data = json.loads(raw)
-    data["cart"] = [agent.Cart(**item) for item in data["cart"]]
-    data["order"] = agent.Order(**data["order"]) if data["order"] else None
-    return data
+    return json.loads(raw) if raw is not None else None
 
 
-def _save_session(session_id: str, session_state: dict[str, Any]) -> None:
-    serializable = {
-        **session_state,
-        "cart": [item.model_dump() for item in session_state["cart"]],
-        "order": session_state["order"].model_dump() if session_state["order"] else None,
-    }
-    redis_client.set(
-        _session_key(session_id),
-        json.dumps(serializable),
-        ex=SESSION_TTL_SECONDS,
-    )
+def _save_session_counters(session_id: str, counters: dict[str, Any]) -> None:
+    redis_client.set(_session_key(session_id), json.dumps(counters), ex=SESSION_TTL_SECONDS)
 
 
 class ChatRequest(BaseModel):
@@ -151,10 +127,7 @@ class ChatRequest(BaseModel):
 
     model_config = {
         "json_schema_extra": {
-            "example": {
-                "message": "show me the menu",
-                "session_id": None,
-            }
+            "example": {"message": "show me the menu", "session_id": None}
         }
     }
 
@@ -163,15 +136,15 @@ class ChatResponse(BaseModel):
     session_id: str
     reply: str
     status: str
-    cart: list[agent.Cart]
-    order: agent.Order | None = None
+    cart: list[dict]
+    order: dict | None = None
     order_id: int | None = None
     cooking_duration: int | None = None
 
 
 @app.get("/menu")
-def get_menu() -> dict[str, Any]:
-    return agent.MENU
+def get_menu() -> list[dict]:
+    return repository.get_active_menu_items()
 
 
 @app.post("/chat")
@@ -179,94 +152,88 @@ def chat(req: ChatRequest) -> ChatResponse:
     start_time = time.monotonic()
     if req.session_id is None:
         session_id = str(uuid.uuid4())
-        session_state = _new_session_state()
+        counters = _new_session_counters()
+        repository.get_or_create_session(session_id)
         current_session_id.set(session_id)
         logger.info("session_created")
     else:
         session_id = req.session_id
         current_session_id.set(session_id)
-        session_state = _load_session(session_id)
-        if session_state is None:
+        counters = _load_session_counters(session_id)
+        if counters is None:
             logger.warning("unknown_session_id")
             raise HTTPException(status_code=404, detail="Unknown session_id")
-        if session_state["status"] == "regretted":
+        if counters["status"] == "regretted":
             logger.info("rejected_closed_session")
             raise HTTPException(
                 status_code=409,
                 detail="This conversation has ended. Please start a new session to order again.",
             )
-        if session_state["turn_count"] >= MAX_TURNS_PER_SESSION:
-            logger.warning("session_turn_limit_reached", extra={"turn_count": session_state["turn_count"]})
+        if counters["turn_count"] >= MAX_TURNS_PER_SESSION:
+            logger.warning("session_turn_limit_reached", extra={"turn_count": counters["turn_count"]})
             raise HTTPException(
                 status_code=409,
                 detail="This conversation has gone on for a while - please start a new session to continue.",
             )
 
-    session_state["turn_count"] = session_state["turn_count"] + 1
-
-    logger.info(
-        "chat_request",
-        extra={"turn_count": session_state["turn_count"], "message_length": len(req.message)},
-    )
+    counters["turn_count"] += 1
+    logger.info("chat_request", extra={"turn_count": counters["turn_count"], "message_length": len(req.message)})
 
     state = {
         "messages": [HumanMessage(content=req.message)],
-        **session_state,
+        "session_id": session_id,
+        "status": counters["status"],
+        "query_count": counters["query_count"],
+        "cook_retry_count": counters["cook_retry_count"],
+        "unclear_count": counters["unclear_count"],
+        "order_id": counters["order_id"],
     }
     try:
         result = agent.graph.invoke(state)
     except groq.GroqError:
-        # The LLM is down/timing out/rate-limited beyond what our own
-        # retries handle. Don't advance or persist session state - the
-        # turn never completed - just hand back a graceful message so
-        # the customer isn't shown a raw error, and they can try again
-        # from exactly where they left off.
+        # Turn never completed - don't persist counters, just give a
+        # graceful reply so the customer can retry from where they were.
         logger.error(
             "llm_failure_fallback",
             extra={"duration_ms": round((time.monotonic() - start_time) * 1000)},
             exc_info=True,
         )
-        order = session_state["order"]
+        cart = repository.get_cart_items(session_id)
+        order = repository.get_order(counters["order_id"]) if counters["order_id"] else None
         return ChatResponse(
             session_id=session_id,
-            reply=(
-                "Sorry, I'm having trouble processing that right now. "
-                "Please try again in a moment."
-            ),
-            status=session_state["status"],
-            cart=session_state["cart"],
+            reply="Sorry, I'm having trouble processing that right now. Please try again in a moment.",
+            status=counters["status"],
+            cart=cart,
             order=order,
-            order_id=order.order_id if order else None,
+            order_id=counters["order_id"],
             cooking_duration=None,
         )
 
-    session_state = {
-        "status": result.get("status", session_state["status"]),
-        "query_count": result.get("query_count", session_state["query_count"]),
-        "cook_retry_count": result.get("cook_retry_count", session_state["cook_retry_count"]),
-        "unclear_count": result.get("unclear_count", session_state["unclear_count"]),
-        "turn_count": session_state["turn_count"],
-        "cart": result.get("cart", session_state["cart"]),
-        "order": result.get("order", session_state["order"]),
+    counters = {
+        "status": result.get("status", counters["status"]),
+        "query_count": result.get("query_count", counters["query_count"]),
+        "cook_retry_count": result.get("cook_retry_count", counters["cook_retry_count"]),
+        "unclear_count": result.get("unclear_count", counters["unclear_count"]),
+        "turn_count": counters["turn_count"],
+        "order_id": result.get("order_id", counters["order_id"]),
     }
-    _save_session(session_id, session_state)
+    _save_session_counters(session_id, counters)
 
     duration_ms = round((time.monotonic() - start_time) * 1000)
-    logger.info(
-        "chat_response",
-        extra={"status": session_state["status"], "duration_ms": duration_ms},
-    )
+    logger.info("chat_response", extra={"status": counters["status"], "duration_ms": duration_ms})
 
     last_message = result["messages"][-1]
     content = getattr(last_message, "content", last_message)
-    order = session_state["order"]
+    cart = repository.get_cart_items(session_id)
+    order = repository.get_order(counters["order_id"]) if counters["order_id"] else None
     return ChatResponse(
         session_id=session_id,
         reply=content,
-        status=session_state["status"],
-        cart=session_state["cart"],
+        status=counters["status"],
+        cart=cart,
         order=order,
-        order_id=order.order_id if order else None,
+        order_id=counters["order_id"],
         cooking_duration=result.get("cooking_duration"),
     )
 

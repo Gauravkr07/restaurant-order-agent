@@ -11,6 +11,22 @@ services:
       timeout: 3s
       retries: 5
 
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432"  # 5433 on the host to avoid clashing with a local Postgres on 5432
+    environment:
+      - POSTGRES_USER=restaurant
+      - POSTGRES_PASSWORD=restaurant
+      - POSTGRES_DB=restaurant_order_agent
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U restaurant -d restaurant_order_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   app:
     build: .
     ports:
@@ -18,12 +34,16 @@ services:
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql+psycopg://restaurant:restaurant@postgres:5432/restaurant_order_agent
       - LANGSMITH_TRACING=${LANGSMITH_TRACING:-false}
       - LANGSMITH_API_KEY=${LANGSMITH_API_KEY:-}
       - LANGSMITH_PROJECT=${LANGSMITH_PROJECT:-restaurant-order-agent}
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
 
 volumes:
   redis-data:
+  postgres-data:

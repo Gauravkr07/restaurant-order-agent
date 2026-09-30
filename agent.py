@@ -1,17 +1,15 @@
 import random
 import re
-from itertools import count
 
 import groq
 from langgraph.graph import StateGraph, START, END
 from pydantic import ValidationError
-from typing import Optional, List, Literal
-import os
+from typing import Literal
 
-from helpers.constants import MENU
+from db import repository
 from helpers.llm import llm
 from helpers.logging_config import get_logger
-from helpers.models import RequestedItem, RequestedItems, Cart, Order, State
+from helpers.models import RequestedItem, RequestedItems, State
 
 logger = get_logger(__name__)
 
@@ -20,7 +18,6 @@ MAX_COOKING_RETRIES = 2
 MAX_UNCLEAR_ATTEMPTS = 3
 COOKING_DURATION_MINUTES = 2
 EXTRACTION_RETRY_ATTEMPTS = 2
-_order_id_counter = count(1)
 
 # Appended to every system prompt that embeds raw customer text, so the
 # model treats that text as data to read, not instructions to follow.
@@ -97,7 +94,10 @@ def extract_requested_items(human_message: str, system_prompt: str) -> Requested
 def show_menu(state: State) -> dict:
     logger.info("node_show_menu")
     query_c = state.get("query_count", 0) + 1
-    menu_items = "\n".join([f"{item.title()} - ₹{details['price']}" for item, details in MENU.items()])
+    menu_items = "\n".join(
+        f"{item['name'].title()} - ₹{item['price']:.0f}"
+        for item in repository.get_active_menu_items()
+    )
     messages = [
         ("system", """
 You are a resteraunt manager.
@@ -212,8 +212,9 @@ def clarify(state: State) -> dict:
 def verify_items(state: State) -> dict:
     logger.info("node_verify_items")
     user_message = state["messages"][-1].content
-    menu_text = "\n".join(
-        [f"{item}: stock={details['stock']}" for item, details in MENU.items()])
+    menu_items = repository.get_active_menu_items()
+    menu_by_name = {item["name"]: item for item in menu_items}
+    menu_text = "\n".join(f"{item['name']}: stock={item['stock']}" for item in menu_items)
     requested = extract_requested_items(
         f"User wants: {user_message}",
         f"""
@@ -227,7 +228,7 @@ Return structured output only.""",
     available: list[RequestedItem] = []
     unavailable: list[str] = []
     for req in requested.items:
-        menu_entry = MENU.get(req.item)
+        menu_entry = menu_by_name.get(req.item)
         if menu_entry is None:
             unavailable.append(f"{req.item} is not on our menu")
             continue
@@ -281,17 +282,21 @@ Return structured output only.""",
 
 
 def add_item(state: State) -> dict:
-    """Re-verifies the last request against MENU and merges it into the cart.
+    """Re-verifies the last request against the menu and merges it into
+    the cart in Postgres (add_cart_item upserts - merge, not replace).
 
     Runs after verify_items has already confirmed at least the available
     portion of the order, so this only adds items that pass stock checks
     again here (defends against stock changing between the two calls).
     """
     logger.info("node_add_item")
+    session_id = state["session_id"]
     user_message = state["messages"][-1].content
+    menu_items = repository.get_active_menu_items()
+    menu_by_name = {item["name"]: item for item in menu_items}
     menu_text = "\n".join(
-        [f"{item}: price={details['price']}, stock={details['stock']}"
-         for item, details in MENU.items()])
+        f"{item['name']}: price={item['price']}, stock={item['stock']}" for item in menu_items
+    )
     response = extract_requested_items(
         f"User wants: {user_message}",
         f"""
@@ -303,26 +308,17 @@ Verify stock availability.
 Return structured output only.""",
     )
 
-    cart_lookup = {item.item: item for item in state.get("cart", [])}
     added: list[RequestedItem] = []
     for item in response.items:
-        menu_entry = MENU.get(item.item)
+        menu_entry = menu_by_name.get(item.item)
         if menu_entry is None or menu_entry["stock"] < item.quantity:
             continue
-        existing = cart_lookup.get(item.item)
-        if existing:
-            existing.quantity += item.quantity
-        else:
-            cart_lookup[item.item] = Cart(
-                item=item.item,
-                quantity=item.quantity,
-                price=menu_entry["price"],
-            )
+        repository.add_cart_item(session_id, item.item, item.quantity)
         added.append(item)
 
-    updated_cart = list(cart_lookup.values())
+    cart_size = len(repository.get_cart_items(session_id))
     added_text = ", ".join(f"{i.quantity} x {i.item}" for i in added) or "nothing new"
-    logger.info("add_item_result", extra={"added": added_text, "cart_size": len(updated_cart)})
+    logger.info("add_item_result", extra={"added": added_text, "cart_size": cart_size})
     confirmation = llm.invoke([
         ("system", "You are a polite restaurant assistant. Confirm what was "
                    "just added to the cart and ask if the customer wants "
@@ -330,7 +326,6 @@ Return structured output only.""",
         ("human", f"Added: {added_text}"),
     ])
     return {
-        "cart": updated_cart,
         "status": "cart",
         "unclear_count": 0,
         "messages": [confirmation],
@@ -339,7 +334,7 @@ Return structured output only.""",
 
 def view_cart(state: State) -> dict:
     logger.info("node_view_cart")
-    cart = state.get("cart", [])
+    cart = repository.get_cart_items(state["session_id"])
     if not cart:
         response = llm.invoke([
             ("system", "You are a polite restaurant assistant."),
@@ -347,8 +342,8 @@ def view_cart(state: State) -> dict:
         ])
         return {"unclear_count": 0, "messages": [response]}
     cart_text = "\n".join(
-        f"{item.quantity} x {item.item} @ ₹{item.price}" for item in cart)
-    total = sum(item.quantity * item.price for item in cart)
+        f"{item['quantity']} x {item['item']} @ ₹{item['price']}" for item in cart)
+    total = sum(item["quantity"] * item["price"] for item in cart)
     response = llm.invoke([
         ("system", "You are a polite restaurant assistant. Present the "
                    "customer's cart clearly with the total."),
@@ -359,6 +354,7 @@ def view_cart(state: State) -> dict:
 
 def remove_item(state: State):
     logger.info("node_remove_item")
+    session_id = state["session_id"]
     user_input = state["messages"][-1].content
     response = extract_requested_items(
         f"remove item{user_input}",
@@ -369,37 +365,20 @@ Extract food items and quantities.
 Return structured output only.
 """,
     )
-    cart_lookup = {
-        item.item: item
-        for item in state["cart"]}
     result_messages = []
     for requested_item in response.items:
-        cart_item = cart_lookup.get(
-            requested_item.item)
-        if not cart_item:
+        outcome = repository.remove_cart_item(session_id, requested_item.item, requested_item.quantity)
+        if outcome == "not_in_cart":
             result_messages.append(f"{requested_item.item} is not in cart.")
-            continue
-        remaining = (
-            cart_item.quantity
-            - requested_item.quantity
-        )
-        if remaining < 0:
-            result_messages.append(
-                f"Only {cart_item.quantity} "
-                f"{requested_item.item} available in cart.")
-            continue
-        if remaining == 0:
-            del cart_lookup[
-                requested_item.item
-            ]
-            result_messages.append(
-                f"{requested_item.item} removed from cart.")
+        elif outcome == "insufficient":
+            current_qty = repository.get_cart_item_quantity(session_id, requested_item.item)
+            result_messages.append(f"Only {current_qty} {requested_item.item} available in cart.")
+        elif outcome == "removed":
+            result_messages.append(f"{requested_item.item} removed from cart.")
         else:
-            cart_item.quantity = remaining
-            result_messages.append(
-                f"{requested_item.item} quantity updated to "
-                f"{remaining}.")
-    updated_cart = list(cart_lookup.values())
+            new_qty = repository.get_cart_item_quantity(session_id, requested_item.item)
+            result_messages.append(f"{requested_item.item} quantity updated to {new_qty}.")
+
     if not result_messages:
         response = llm.invoke([
             ("system", "You are a polite restaurant assistant."),
@@ -409,12 +388,10 @@ Return structured output only.
                       "like to remove, e.g. \"remove 1 pizza\"."),
         ])
         return {
-            "cart": updated_cart,
             "unclear_count": 0,
             "messages": [response],
         }
     return {
-        "cart": updated_cart,
         "unclear_count": 0,
         "messages": result_messages
     }
@@ -422,8 +399,8 @@ Return structured output only.
 
 def checkout(state: State) -> dict:
     logger.info("node_checkout")
-    cart = state.get("cart", [])
-    if not cart:
+    order = repository.create_order_from_cart(state["session_id"])
+    if order is None:
         response = llm.invoke([
             ("system", "You are a polite restaurant assistant."),
             ("human", "Tell the customer their cart is empty, so there is "
@@ -431,33 +408,37 @@ def checkout(state: State) -> dict:
         ])
         return {"unclear_count": 0, "messages": [response]}
 
-    order = Order(status="ordered", order_id=next(_order_id_counter), items=cart)
-    logger.info("order_created", extra={"order_id": order.order_id, "item_count": len(cart)})
-    cart_text = "\n".join(f"{i.quantity} x {i.item}" for i in cart)
+    logger.info("order_created", extra={"order_id": order["order_id"], "item_count": len(order["items"])})
+    cart_text = "\n".join(f"{i['quantity']} x {i['item']}" for i in order["items"])
     response = llm.invoke([
         ("system", "You are a polite restaurant assistant. Confirm the order "
                    "was placed and share the order id."),
-        ("human", f"Order #{order.order_id} placed:\n{cart_text}"),
+        ("human", f"Order #{order['order_id']} placed:\n{cart_text}"),
     ])
-    return {"order": order, "status": "ordered", "unclear_count": 0, "messages": [response]}
+    return {
+        "order_id": order["order_id"],
+        "status": "ordered",
+        "unclear_count": 0,
+        "messages": [response],
+    }
 
 
 def cooking_stage(state: State) -> dict:
     logger.info("node_cooking_stage")
-    order = state.get("order")
+    order_id = state.get("order_id")
     retry_count = state.get("cook_retry_count", 0)
 
     cooking_failed = random.random() < 0.2
     if cooking_failed and retry_count < MAX_COOKING_RETRIES:
         logger.warning(
             "cooking_retry",
-            extra={"order_id": order.order_id if order else None, "attempt": retry_count + 1},
+            extra={"order_id": order_id, "attempt": retry_count + 1},
         )
         response = llm.invoke([
             ("system", "You are a polite restaurant assistant. Let the "
                        "customer know there was a small hiccup in the kitchen "
                        "and you're retrying their order."),
-            ("human", f"Order #{order.order_id if order else '?'} is being retried."),
+            ("human", f"Order #{order_id if order_id else '?'} is being retried."),
         ])
         return {
             "status": "cooking_retry",
@@ -469,14 +450,16 @@ def cooking_stage(state: State) -> dict:
     if cooking_failed:
         logger.error(
             "cooking_failed_permanently",
-            extra={"order_id": order.order_id if order else None, "retries_exhausted": retry_count},
+            extra={"order_id": order_id, "retries_exhausted": retry_count},
         )
+        if order_id is not None:
+            repository.update_order_status(order_id, "refunded")
         response = llm.invoke([
             ("system", "You are a polite restaurant assistant. Apologize "
                        "sincerely that the kitchen could not prepare the order "
                        "after multiple attempts, and let the customer know a "
                        "refund will be issued."),
-            ("human", f"Order #{order.order_id if order else '?'} could not "
+            ("human", f"Order #{order_id if order_id else '?'} could not "
                       "be cooked after retries."),
         ])
         return {
@@ -486,11 +469,11 @@ def cooking_stage(state: State) -> dict:
         }
 
     duration = COOKING_DURATION_MINUTES
-    logger.info("cooking_started", extra={"order_id": order.order_id if order else None, "duration_minutes": duration})
+    logger.info("cooking_started", extra={"order_id": order_id, "duration_minutes": duration})
     response = llm.invoke([
         ("system", "You are a polite restaurant assistant. Tell the customer "
                    "cooking has started and give the estimated time."),
-        ("human", f"Order #{order.order_id if order else '?'} is cooking, "
+        ("human", f"Order #{order_id if order_id else '?'} is cooking, "
                   f"estimated {duration} minutes."),
     ])
     return {
@@ -503,17 +486,16 @@ def cooking_stage(state: State) -> dict:
 
 def delivery(state: State) -> dict:
     logger.info("node_delivery")
-    order = state.get("order")
-    if order:
-        order = order.model_copy(update={"status": "delivered"})
-    logger.info("order_delivered", extra={"order_id": order.order_id if order else None})
-    cart_text = "\n".join(f"{i.quantity} x {i.item}" for i in (order.items if order else []))
+    order_id = state.get("order_id")
+    order = repository.update_order_status(order_id, "delivered") if order_id is not None else None
+    logger.info("order_delivered", extra={"order_id": order_id})
+    cart_text = "\n".join(f"{i['quantity']} x {i['item']}" for i in (order["items"] if order else []))
     response = llm.invoke([
         ("system", "You are a polite restaurant assistant. Tell the customer "
                    "their order has been delivered, thank them warmly."),
-        ("human", f"Order #{order.order_id if order else '?'} delivered:\n{cart_text}"),
+        ("human", f"Order #{order_id if order_id else '?'} delivered:\n{cart_text}"),
     ])
-    return {"order": order, "status": "delivered", "messages": [response]}
+    return {"status": "delivered", "messages": [response]}
 
 
 def route_after_verify(state: State) -> Literal["ADD_ITEM", "END"]:
@@ -576,20 +558,3 @@ builder.add_conditional_edges(
 )
 builder.add_edge("delivery", END)
 graph = builder.compile()
-
-
-
-
-# from langchain_core.messages import HumanMessage
-
-# if __name__ == "__main__":
-#     test_state = {
-#         "messages": [
-#             HumanMessage(content="I want remove 1 pizzas and 1 coke")
-#         ],
-#         "cart": [
-#             Cart(item="pizza", quantity=5, price=200),
-#             Cart(item="coke", quantity=2, price=50),
-#         ],
-#     }
-#     print(remove_item(test_state))

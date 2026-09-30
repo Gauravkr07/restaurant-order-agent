@@ -6,3 +6,6 @@ python-dotenv
 fastapi
 uvicorn[standard]
 redis
+sqlalchemy
+alembic
+psycopg[binary]

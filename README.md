@@ -18,21 +18,26 @@ A LangGraph-based restaurant ordering agent, exposed as a FastAPI service.
 - `service.py` — thin FastAPI service layer that wraps `agent.py` and exposes it over HTTP as a single stateful `/chat` endpoint.
 - `helpers/constants.py` — static data (currently the `MENU`).
 - `helpers/llm.py` — LLM client setup/connectivity (the `ChatGroq` instance), imported by `agent.py`.
-- `helpers/models.py` — all Pydantic/data models (`RequestedItem`, `RequestedItems`, `Cart`, `Order`, `State`, `Status`), imported by `agent.py`.
+- `helpers/models.py` — Pydantic/data models (`RequestedItem`, `RequestedItems`, `State`, `Status`), imported by `agent.py`.
 - `helpers/logging_config.py` — structured JSON logging setup, shared across `agent.py` and `service.py` (see [Logging](#logging)).
+- `db/models.py` / `db/repository.py` / `db/seed.py` — the data layer: SQLAlchemy models, the repository ("Tools") layer, and a menu seed script (see [Data layer](#data-layer)).
+- `alembic/` — database migrations.
 - `static/index.html` — a minimal browser chat UI for `/chat` (plain HTML/JS, no build step).
 - `demo.png` — screenshot of the UI, shown at the top of this README (not committed by default — add your own).
 - `tests/` — pytest suite covering `agent.py`'s nodes (see [Testing](#testing)).
-- `Dockerfile` / `docker-compose.yml` — containerized app + Redis (see [Run with Docker](#run-with-docker)).
-- `.env.example` — copy to `.env` and fill in your `GROQ_API_KEY` (and optionally `REDIS_URL`, `LANGSMITH_*` — see [Debugging & tracing](#debugging--tracing-langsmith)).
+- `Dockerfile` / `docker-compose.yml` — containerized app + Postgres + Redis (see [Run with Docker](#run-with-docker)).
+- `.env.example` — copy to `.env` and fill in your `GROQ_API_KEY` (and optionally `DATABASE_URL`, `REDIS_URL`, `LANGSMITH_*`).
 
 ## Setup
 
-Requires a running Redis server (session state is stored there — see [Session persistence](#session-persistence)):
+Requires Postgres (source of truth — see [Data layer](#data-layer)) and Redis (session counters):
 
 ```bash
-brew install redis        # macOS; see redis.io for other platforms
+brew install postgresql@16 redis   # macOS; see postgresql.org/redis.io for other platforms
+brew services start postgresql@16
 brew services start redis
+createuser restaurant -P   # password: restaurant
+createdb restaurant_order_agent -O restaurant
 ```
 
 Then the app itself:
@@ -42,6 +47,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # then edit .env with your real GROQ_API_KEY
+alembic upgrade head
+python -m db.seed
 ```
 
 ## Run
@@ -57,19 +64,20 @@ Service runs at http://localhost:8000:
 
 ### Run with Docker
 
-A `docker-compose.yml` runs the app and Redis together — no local Python venv or `brew install redis` needed:
+A `docker-compose.yml` runs the app, Postgres, and Redis together — no local Postgres/Redis install needed:
 
 ```bash
 cp .env.example .env   # then edit .env with your real GROQ_API_KEY
 docker compose up --build
 ```
 
-This starts two containers:
+This starts three containers:
 
-- `redis` — a `redis:7-alpine` container, persisted via a named volume (`redis-data`) so sessions survive `docker compose restart`.
-- `app` — the FastAPI service, built from the `Dockerfile`, connecting to the `redis` container over Docker's internal network (`REDIS_URL=redis://redis:6379/0` — note the hostname is the Compose service name `redis`, not `localhost`, since containers resolve each other by service name).
+- `postgres` — a `postgres:16-alpine` container, persisted via a named volume (`postgres-data`), exposed on host port **5433** (not 5432, to avoid clashing with a local Postgres install).
+- `redis` — a `redis:7-alpine` container, persisted via a named volume (`redis-data`).
+- `app` — the FastAPI service, built from the `Dockerfile`. On start it runs `alembic upgrade head` then `python -m db.seed` automatically, then starts `uvicorn`. Connects to both over Docker's internal network (`postgres:5432`, `redis:6379` — service names, not `localhost`).
 
-`docker-compose.yml` reads `GROQ_API_KEY` from your `.env` file in the same directory. The app container won't start cooking/verifying anything until Redis reports healthy (`depends_on: condition: service_healthy`).
+`docker-compose.yml` reads `GROQ_API_KEY` from your `.env` file in the same directory. The app container waits for both `postgres` and `redis` to report healthy before starting.
 
 Same URLs as running locally: http://localhost:8000/ for the chat UI, http://localhost:8000/docs for the API docs.
 
@@ -124,18 +132,20 @@ The current version adds a 6th label, `UNCLEAR`, with explicit instructions not 
 
 This is the difference between a *classifier* (always outputs one of N fixed labels, even when none fit) and something closer to *agentic* behavior (recognizes the limits of its own understanding and asks rather than acting on a guess). It's a small change — one new label, one new node — but it changes what the system does when it doesn't know, which is where a lot of real agent failures come from.
 
-## Session persistence
+## Data layer
 
-Session state is stored in Redis, not in server memory. This means restarting `uvicorn` (a crash, a deploy, `--reload` picking up a code change) no longer loses anyone's cart or order — the customer's `session_id` still resolves to their conversation.
+**PostgreSQL is the source of truth** for menu, sessions, carts, and orders — not Redis. Architecture: `FastAPI → LangGraph → db/repository.py ("Tools") → PostgreSQL`.
 
-How it works (`service.py`):
+- `db/models.py` — SQLAlchemy models for 6 tables: `menu_items`, `sessions`, `carts`, `cart_items`, `orders`, `order_items`. (`restaurants`/`users`/`payments`/`agent_runs` were considered and deliberately left out — see `prompt_implementation.md`'s dated instructions for why.)
+- `db/repository.py` — the only place that talks to Postgres. Each function opens its own short session, does one unit of work, commits. `agent.py`'s nodes call these as plain functions (e.g. `repository.add_cart_item(session_id, "pizza", 2)`), never touching SQL directly.
+- `alembic/` — migrations. `alembic upgrade head` applies them; runs automatically on container start (see `Dockerfile`).
+- `db/seed.py` — seeds `menu_items` with the starter menu (`python -m db.seed`); safe to re-run.
+- Cart merge-not-replace, one-cart-per-session, etc. are enforced by DB constraints (`uq_cart_item`, unique `carts.session_id`), not just application logic — see the initial migration in `alembic/versions/`.
+- `checkout` snapshots each line's price into `order_items.price_at_order`, so a later menu price change never rewrites history.
 
-- Each session is one Redis key: `session:<session_id>` → a JSON string of `{status, query_count, cook_retry_count, unclear_count, cart, order}`.
-- `_load_session` / `_save_session` handle the JSON encode/decode and rebuild `Cart`/`Order` Pydantic models on read.
-- Sessions auto-expire after 24h of inactivity (`SESSION_TTL_SECONDS` in `service.py`), refreshed on every write — no manual cleanup needed for abandoned carts.
-- Connection is configured via `REDIS_URL` (defaults to `redis://localhost:6379/0` if unset).
+**Redis** now only holds per-turn session counters (`status`, `query_count`, `cook_retry_count`, `unclear_count`, `turn_count`) — cache/session-scoped, not the source of truth for anything durable. Keys still auto-expire after 24h of inactivity (`SESSION_TTL_SECONDS` in `service.py`).
 
-`agent.py` (the LangGraph logic itself) is untouched by this — session storage is entirely a `service.py` concern, which is why swapping it didn't require any changes to the graph.
+`LangGraph`'s own state-update mechanism (`State`, returned from each node, merged by the graph) is unchanged and still how nodes communicate *within* one `/chat` call — `State` just no longer carries `cart`/`order` copies, only `session_id`, `order_id`, and the routing/counter fields, since the durable data lives in Postgres and is fetched fresh via the repository whenever a node needs it.
 
 ## Debugging & tracing (LangSmith)
 

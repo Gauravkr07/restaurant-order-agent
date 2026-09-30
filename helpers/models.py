@@ -1,4 +1,4 @@
-from typing import Any, List, Literal
+from typing import Literal
 
 from langgraph.graph import MessagesState
 from pydantic import BaseModel, Field
@@ -41,12 +41,11 @@ class Order(BaseModel):
 
 
 class State(MessagesState):
+    session_id: str
     status: Status = "browsing"
     query_count: int = 0
     cook_retry_count: int = 0
     unclear_count: int = 0
     turn_count: int = 0
     cooking_duration: int | None = None
-    cart: List[Cart]
-    order: Order | None = None
-    payment: dict[str, Any] = {}
+    order_id: int | None = None

@@ -2,12 +2,6 @@ import os
 import sys
 from pathlib import Path
 
-# Must happen before `import agent` (directly or transitively) anywhere in
-# the test suite: agent.py imports helpers.llm, which constructs a real
-# ChatGroq client at module load time. ChatGroq raises immediately if no
-# API key is present - it doesn't matter that every test here replaces
-# agent.llm with a fake before use, since that swap happens after import.
-# The value itself is never used to make a real request.
 os.environ.setdefault("GROQ_API_KEY", "test-dummy-key")
 
 import pytest
@@ -15,17 +9,16 @@ from langchain_core.messages import AIMessage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from helpers.models import Cart, RequestedItem, RequestedItems
+from helpers.models import RequestedItem, RequestedItems
+
+MENU = {
+    "pizza": {"price": 200.0, "stock": 20},
+    "burger": {"price": 150.0, "stock": 15},
+    "coke": {"price": 50.0, "stock": 50},
+}
 
 
 class FakeStructuredExtractor:
-    """Stands in for llm.with_structured_output(RequestedItems).
-
-    `result` is either a RequestedItems instance to return, or an exception
-    (or list of exceptions/results, consumed in order) to raise - lets tests
-    simulate the Groq flakiness that extract_requested_items() retries on.
-    """
-
     def __init__(self, result):
         self._queue = result if isinstance(result, list) else [result]
 
@@ -37,15 +30,6 @@ class FakeStructuredExtractor:
 
 
 class FakeLLM:
-    """Stands in for helpers.llm.llm.
-
-    - `intent`: what route_intent's classification call should return.
-    - `reply_text`: content for any plain llm.invoke() call (confirmations,
-      menu text, apologies, etc.) - tests should not assert on this wording.
-    - `extraction_result`: what with_structured_output(...).invoke() returns;
-      see FakeStructuredExtractor for the retry-simulation shape.
-    """
-
     def __init__(self, intent="SHOW_MENU", reply_text="ok", extraction_result=None):
         self.intent = intent
         self.reply_text = reply_text
@@ -67,6 +51,68 @@ class FakeLLM:
         return FakeStructuredExtractor(self.extraction_result)
 
 
+class FakeRepository:
+    """In-memory stand-in for db.repository, keyed by session_id, so the
+    unit test suite stays offline/fast - no real Postgres needed here."""
+
+    def __init__(self):
+        self.carts: dict[str, dict[str, int]] = {}
+        self.orders: dict[int, dict] = {}
+        self._next_order_id = 1
+
+    def get_active_menu_items(self):
+        return [{"name": k, **v} for k, v in MENU.items()]
+
+    def get_menu_item(self, name):
+        return {"name": name, **MENU[name]} if name in MENU else None
+
+    def get_cart_items(self, session_id):
+        cart = self.carts.get(session_id, {})
+        return [{"item": k, "quantity": q, "price": MENU[k]["price"]} for k, q in cart.items()]
+
+    def add_cart_item(self, session_id, item_name, quantity):
+        cart = self.carts.setdefault(session_id, {})
+        cart[item_name] = cart.get(item_name, 0) + quantity
+
+    def get_cart_item_quantity(self, session_id, item_name):
+        return self.carts.get(session_id, {}).get(item_name, 0)
+
+    def remove_cart_item(self, session_id, item_name, quantity):
+        cart = self.carts.get(session_id, {})
+        if item_name not in cart:
+            return "not_in_cart"
+        remaining = cart[item_name] - quantity
+        if remaining < 0:
+            return "insufficient"
+        if remaining == 0:
+            del cart[item_name]
+            return "removed"
+        cart[item_name] = remaining
+        return "updated"
+
+    def create_order_from_cart(self, session_id):
+        cart = self.carts.get(session_id, {})
+        if not cart:
+            return None
+        items = [{"item": k, "quantity": q, "price": MENU[k]["price"]} for k, q in cart.items()]
+        order_id = self._next_order_id
+        self._next_order_id += 1
+        order = {"order_id": order_id, "status": "ordered", "items": items}
+        self.orders[order_id] = order
+        self.carts[session_id] = {}
+        return order
+
+    def get_order(self, order_id):
+        return self.orders.get(order_id)
+
+    def update_order_status(self, order_id, status):
+        order = self.orders.get(order_id)
+        if order is None:
+            return None
+        order["status"] = status
+        return order
+
+
 @pytest.fixture
 def fake_llm(monkeypatch):
     llm = FakeLLM()
@@ -75,22 +121,21 @@ def fake_llm(monkeypatch):
 
 
 @pytest.fixture
-def sample_cart():
-    return [
-        Cart(item="pizza", quantity=2, price=200.0),
-        Cart(item="coke", quantity=1, price=50.0),
-    ]
+def fake_repository(monkeypatch):
+    repo = FakeRepository()
+    monkeypatch.setattr("agent.repository", repo)
+    return repo
 
 
 @pytest.fixture
 def base_state():
     return {
         "messages": [],
+        "session_id": "test-session",
         "status": "browsing",
         "query_count": 0,
         "cook_retry_count": 0,
         "unclear_count": 0,
         "cooking_duration": None,
-        "cart": [],
-        "order": None,
+        "order_id": None,
     }

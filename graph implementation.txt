@@ -1,9 +1,0 @@
-START --route_intent--> SHOW_MENU -> show_menu -> END (loops back via client re-invoke)
-                      -> ADD_ITEM (order directly) -> verify_items
-                      -> VIEW_CART -> view_cart -> END
-                      -> REMOVE_ITEM -> remove_item -> END
-                      -> CHECKOUT -> checkout -> cooking_stage -> delivery -> END
-
-verify_items --all available--> add_item -> END
-verify_items --partial/none, retries left--> END (waits for user reply)
-verify_items --retries exhausted--> regret -> END

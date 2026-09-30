@@ -22,7 +22,7 @@ A LangGraph-based restaurant ordering agent, exposed as a FastAPI service.
 - `helpers/logging_config.py` — structured JSON logging setup, shared across `agent.py` and `service.py` (see [Logging](#logging)).
 - `db/models.py` / `db/repository.py` / `db/seed.py` — the data layer: SQLAlchemy models, the repository ("Tools") layer, and a menu seed script (see [Data layer](#data-layer)).
 - `alembic/` — database migrations.
-- `static/index.html` — a minimal browser chat UI for `/chat` (plain HTML/JS, no build step).
+- `static/index.html` — a minimal browser chat UI for `/chat` (plain HTML/JS, no build step). Its Checkout button calls `POST /checkout` directly (not a chat message), generating and reusing an `Idempotency-Key` per cart so a double-click can't create two orders — see [Endpoints](#endpoints).
 - `demo.png` — screenshot of the UI, shown at the top of this README (not committed by default — add your own).
 - `tests/` — pytest suite covering `agent.py`'s nodes (see [Testing](#testing)).
 - `Dockerfile` / `docker-compose.yml` — containerized app + Postgres + Redis (see [Run with Docker](#run-with-docker)).

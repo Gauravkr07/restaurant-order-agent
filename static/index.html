@@ -148,7 +148,7 @@
   <div class="quick-actions">
     <button type="button" data-msg="show me the menu">Show menu</button>
     <button type="button" data-msg="show my cart">View cart</button>
-    <button type="button" data-msg="checkout please">Checkout</button>
+    <button type="button" id="checkout-btn">Checkout</button>
   </div>
 
   <form id="chat-form">
@@ -171,6 +171,18 @@
   let sessionId = null;
   try { sessionId = localStorage.getItem("session_id"); } catch (e) {}
 
+  // A fresh key per checkout *attempt* on the current cart - reused if
+  // the button is clicked again before the cart changes, so a double
+  // click (or a retry after a dropped connection) hits the same
+  // Idempotency-Key and the backend's /checkout returns the SAME order
+  // instead of creating a second one. Regenerated after any successful
+  // chat turn that changes the cart (add/remove), since that's a new
+  // checkout-worthy state.
+  let checkoutIdempotencyKey = null;
+  function newIdempotencyKey() {
+    return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+  }
+
   function addMessage(text, role) {
     const div = document.createElement("div");
     div.className = "msg " + role;
@@ -180,12 +192,22 @@
     return div;
   }
 
+  let lastCartSignature = null;
   function updateStatusBar(data) {
     statusEl.textContent = data.status || "browsing";
     const cart = data.cart || [];
     const totalQty = cart.reduce((sum, i) => sum + i.quantity, 0);
     cartCountEl.textContent = totalQty;
     orderIdEl.textContent = data.order ? ("#" + data.order.order_id + " (" + data.order.status + ")") : "none";
+
+    // Cart changed since the last checkout attempt -> old idempotency
+    // key no longer represents "this same order", so retire it. A new
+    // one is generated the next time Checkout is actually clicked.
+    const cartSignature = JSON.stringify(cart);
+    if (cartSignature !== lastCartSignature) {
+      checkoutIdempotencyKey = null;
+    }
+    lastCartSignature = cartSignature;
   }
 
   async function sendMessage(text) {
@@ -232,6 +254,57 @@
     }
   }
 
+  async function checkout() {
+    if (!sessionId) {
+      addMessage("Say hello or add something to your cart before checking out.", "error");
+      return;
+    }
+    if (!checkoutIdempotencyKey) {
+      checkoutIdempotencyKey = newIdempotencyKey();
+    }
+
+    addMessage("checkout", "user");
+    const pending = addMessage("...", "bot pending");
+    checkoutBtn.disabled = true;
+
+    try {
+      const res = await fetch(API_BASE + "/checkout", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": checkoutIdempotencyKey,
+        },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+
+      if (!res.ok) {
+        let detail = "Something went wrong (" + res.status + ").";
+        try {
+          const errBody = await res.json();
+          if (errBody && errBody.detail) detail = errBody.detail;
+        } catch (e) {}
+        pending.remove();
+        addMessage(detail, "error");
+        return;
+      }
+
+      const data = await res.json();
+      pending.remove();
+      const itemsText = data.items.map((i) => i.quantity + " x " + i.item).join(", ");
+      const note = data.created ? "" : " (already placed — showing your existing order)";
+      addMessage("Order #" + data.order_id + " placed: " + itemsText + note, "bot");
+      // Cart is now empty server-side; reflect that and retire the key
+      // used for this now-completed checkout.
+      updateStatusBar({ status: data.status, cart: [], order: { order_id: data.order_id, status: data.status } });
+      checkoutIdempotencyKey = null;
+    } catch (err) {
+      pending.remove();
+      addMessage("Could not reach the server. Is it running?", "error");
+    } finally {
+      checkoutBtn.disabled = false;
+    }
+  }
+
   form.addEventListener("submit", (e) => {
     e.preventDefault();
     const text = input.value.trim();
@@ -239,12 +312,17 @@
     sendMessage(text);
   });
 
-  document.querySelectorAll(".quick-actions button").forEach((btn) => {
+  document.querySelectorAll(".quick-actions button[data-msg]").forEach((btn) => {
     btn.addEventListener("click", () => sendMessage(btn.dataset.msg));
   });
 
+  const checkoutBtn = document.getElementById("checkout-btn");
+  checkoutBtn.addEventListener("click", checkout);
+
   resetBtn.addEventListener("click", () => {
     sessionId = null;
+    checkoutIdempotencyKey = null;
+    lastCartSignature = null;
     try { localStorage.removeItem("session_id"); } catch (e) {}
     messagesEl.innerHTML = "";
     statusEl.textContent = "browsing";

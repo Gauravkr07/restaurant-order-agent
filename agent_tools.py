@@ -93,7 +93,7 @@ def request_refund_for_order(order_id: int) -> dict | None:
     cooking - use cancel_order for an order that hasn't started cooking
     yet - or a refund was already requested/resolved for it).
 
-    Refunds up to ₹10,000 are approved immediately (returned status:
+    Refunds up to ₹100 are approved immediately (returned status:
     "refunded"). Larger refunds need a human to review them first
     (returned status: "pending_refund_approval") - tell the customer
     it's being reviewed and will be handled shortly, don't imply it's

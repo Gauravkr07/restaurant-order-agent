@@ -382,7 +382,7 @@ def update_order_status(order_id: int, status: str, expected_version: int | None
 # table gets built later, swap get_order_total's source for the actual
 # amount charged instead of re-deriving it from line items.
 
-REFUND_APPROVAL_THRESHOLD = 10_000  # INR; above this, a human must approve
+REFUND_APPROVAL_THRESHOLD = 100  # INR; above this, a human must approve
 
 
 def get_order_total(order_id: int) -> float | None:

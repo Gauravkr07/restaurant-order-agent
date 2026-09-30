@@ -271,7 +271,7 @@ docker run -p 8000:8000 \
 
 - `GET /orders/{order_id}` — public order tracking by order number (no auth — same as the rest of this app). Returns `{order_id, status, items}`, `404` if the order doesn't exist. The chat UI has a "Track order" box that calls this directly.
 
-- `POST /orders/{order_id}/approve-refund` / `POST /orders/{order_id}/reject-refund` — resolve a refund parked at `pending_refund_approval` (order total over ₹10,000 — see [Data layer](#data-layer)). No admin UI yet; call these directly. `404` if the order isn't currently awaiting approval.
+- `POST /orders/{order_id}/approve-refund` / `POST /orders/{order_id}/reject-refund` — resolve a refund parked at `pending_refund_approval` (order total over ₹100 — see [Data layer](#data-layer)). No admin UI yet; call these directly. `404` if the order isn't currently awaiting approval.
 
 Customers can also ask about an existing order **conversationally** through `/chat` — "what's the status of order 16?", "I'd like a refund for order 17", "cancel order 16" all route to a tool-calling flow (`get_order_status` / `request_refund_for_order` / `cancel_order`) rather than a fixed endpoint call, same pattern as ordering/cart management.
 

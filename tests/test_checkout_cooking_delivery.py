@@ -61,7 +61,7 @@ def test_cooking_stage_failure_retries_when_attempts_remain(fake_llm, fake_repos
 
 def test_cooking_stage_failure_regrets_after_retries_exhausted(fake_llm, fake_repository, base_state, monkeypatch):
     monkeypatch.setattr(agent.random, "random", lambda: 0.0)
-    fake_repository.add_cart_item("test-session", "pizza", 1)
+    fake_repository.add_cart_item("test-session", "coke", 1)  # 50, under the 100 threshold
     order = fake_repository.create_order_from_cart("test-session")
     result = agent.cooking_stage(
         _state(base_state, order_id=order["order_id"], cook_retry_count=agent.MAX_COOKING_RETRIES)
@@ -74,8 +74,7 @@ def test_cooking_stage_failure_regrets_after_retries_exhausted(fake_llm, fake_re
 
 def test_cooking_stage_large_refund_needs_human_approval(fake_llm, fake_repository, base_state, monkeypatch):
     monkeypatch.setattr(agent.random, "random", lambda: 0.0)
-    fake_repository.add_cart_item("test-session", "pizza", 50)  # 50 x 200 = 10,000
-    fake_repository.add_cart_item("test-session", "burger", 1)  # tips it over 10,000
+    fake_repository.add_cart_item("test-session", "pizza", 1)  # 200, over the 100 threshold
     order = fake_repository.create_order_from_cart("test-session")
     result = agent.cooking_stage(
         _state(base_state, order_id=order["order_id"], cook_retry_count=agent.MAX_COOKING_RETRIES)
@@ -86,7 +85,7 @@ def test_cooking_stage_large_refund_needs_human_approval(fake_llm, fake_reposito
 
 def test_cooking_stage_small_refund_auto_approved(fake_llm, fake_repository, base_state, monkeypatch):
     monkeypatch.setattr(agent.random, "random", lambda: 0.0)
-    fake_repository.add_cart_item("test-session", "pizza", 1)
+    fake_repository.add_cart_item("test-session", "coke", 1)  # 50, under the 100 threshold
     order = fake_repository.create_order_from_cart("test-session")
     result = agent.cooking_stage(
         _state(base_state, order_id=order["order_id"], cook_retry_count=agent.MAX_COOKING_RETRIES)

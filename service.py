@@ -337,7 +337,7 @@ def checkout_endpoint(
 # --- human-in-the-loop refund approval (V3.3) ---
 # No admin UI yet - these are plain endpoints a human (you, today) calls
 # directly, e.g. via curl/Postman, after reviewing a large refund. See
-# db/repository.py's request_refund for the >10,000 threshold logic that
+# db/repository.py's request_refund for the >100 threshold logic that
 # routes an order here in the first place.
 
 class RefundDecisionResponse(BaseModel):

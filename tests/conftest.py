@@ -153,7 +153,7 @@ class FakeRepository:
         if order is None or order["status"] not in ("ordered", "delivered"):
             return None
         total = self.get_order_total(order_id)
-        status = "pending_refund_approval" if total > 10_000 else "refunded"
+        status = "pending_refund_approval" if total > 100 else "refunded"
         return self.update_order_status(order_id, status)
 
 

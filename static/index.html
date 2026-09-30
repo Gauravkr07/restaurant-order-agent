@@ -136,6 +136,10 @@
   <header>
     <h1>🍽️ Restaurant Order Agent</h1>
     <div class="meta">
+      <span id="track-order" style="display:flex; gap:6px; align-items:center;">
+        <input id="track-order-input" type="number" min="1" placeholder="Order #" style="width:90px; padding:4px 10px; border:1px solid var(--border); border-radius:999px; font-size:12px;" />
+        <button type="button" id="track-order-btn" class="secondary" style="padding:3px 10px; font-size:12px;">Track</button>
+      </span>
       <span>Status: <b id="status">browsing</b></span>
       <span>Cart items: <b id="cart-count">0</b></span>
       <span>Order: <b id="order-id">none</b></span>
@@ -144,11 +148,6 @@
   </header>
 
   <div id="messages"></div>
-
-  <div id="track-order" style="display:flex; gap:8px; padding:0 20px 12px;">
-    <input id="track-order-input" type="number" min="1" placeholder="Order # to track" style="flex:1; padding:8px 12px; border:1px solid var(--border); border-radius:999px; font-size:13px;" />
-    <button type="button" id="track-order-btn" class="secondary">Track</button>
-  </div>
 
   <div class="quick-actions">
     <button type="button" data-msg="show me the menu">Show menu</button>

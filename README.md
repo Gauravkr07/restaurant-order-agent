@@ -1,5 +1,7 @@
 # restaurant-order-agent
 
+[![CI](https://github.com/Gauravkr07/restaurant-order-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Gauravkr07/restaurant-order-agent/actions/workflows/ci.yml)
+
 A LangGraph-based restaurant ordering agent, exposed as a FastAPI service.
 
 ## Demo
@@ -177,7 +179,7 @@ Set `LOG_LEVEL` in `.env` to control verbosity (defaults to `INFO`; use `DEBUG` 
 
 ## Testing
 
-The test suite covers `agent.py`'s node functions directly — the LLM is replaced with a fake (`tests/conftest.py`'s `FakeLLM`) so tests run offline, deterministically, and in well under a second, with no Groq API key or running Redis server required.
+The test suite covers `agent.py`'s node functions directly — the LLM is replaced with a fake (`tests/conftest.py`'s `FakeLLM`) so tests run offline, deterministically, and in well under a second. No *real* Groq API key or running Redis server is required — `conftest.py` sets a harmless placeholder key so `ChatGroq` can construct itself, but no real request is ever made.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -198,10 +200,21 @@ What's covered (see `prompt_testcase.md` for the full spec this suite was built 
 
 `.github/workflows/ci.yml` runs on GitHub Actions with two jobs:
 
-- **`test`** — on every push (any branch) and every pull request targeting `main`: installs `requirements-dev.txt` and runs the full `pytest` suite. No Groq API key or Redis instance needed, since the suite is fully offline (see [Testing](#testing)).
-- **`publish`** — only after `test` passes, and only on a direct push to `main` (`needs: test` + a branch/event condition, so a broken build can never be published): builds the Docker image and pushes it to GitHub Container Registry as `ghcr.io/<owner>/<repo>:latest` and `:<commit-sha>`. Uses the automatic `GITHUB_TOKEN` GitHub provides to every workflow run — no extra secrets or accounts to set up.
+- **`test`** — on every push (any branch) and every pull request targeting `main`: installs `requirements-dev.txt` and runs the full `pytest` suite. No Groq API key or Redis instance needed, since the suite is fully offline (see [Testing](#testing)) — `tests/conftest.py` sets a dummy `GROQ_API_KEY` before `agent.py` is imported, since `ChatGroq`'s constructor requires *some* key to be present even though the fake LLM used in tests never makes a real call.
+- **`publish`** — only after `test` passes, and only on a direct push to `main` (`needs: test` + a branch/event condition, so a broken build can never be published): builds the Docker image and pushes it to GitHub Container Registry as `ghcr.io/gauravkr07/restaurant-order-agent:latest` and `:<commit-sha>` (the repository name is lowercased in its own step, since Docker tags reject uppercase). Uses the automatic `GITHUB_TOKEN` GitHub provides to every workflow run — no extra secrets or accounts to set up.
 
 This covers CI (automated testing on every change) and CD up through "produce a deployable, versioned image" — it does not deploy that image anywhere yet, since that depends on where you eventually host the app (a VPS, a cloud container service, etc.), which is a separate decision.
+
+Pulling and running the published image directly (once it's public, or after `docker login ghcr.io` if kept private):
+
+```bash
+docker run -p 8000:8000 \
+  -e GROQ_API_KEY=your_groq_api_key_here \
+  -e REDIS_URL=redis://host.docker.internal:6379/0 \
+  ghcr.io/gauravkr07/restaurant-order-agent:latest
+```
+
+(Still needs a reachable Redis — see [Run with Docker](#run-with-docker) for the full `docker-compose.yml` setup that includes one.)
 
 ## Endpoints
 

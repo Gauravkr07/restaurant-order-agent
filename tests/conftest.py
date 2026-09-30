@@ -1,5 +1,14 @@
+import os
 import sys
 from pathlib import Path
+
+# Must happen before `import agent` (directly or transitively) anywhere in
+# the test suite: agent.py imports helpers.llm, which constructs a real
+# ChatGroq client at module load time. ChatGroq raises immediately if no
+# API key is present - it doesn't matter that every test here replaces
+# agent.llm with a fake before use, since that swap happens after import.
+# The value itself is never used to make a real request.
+os.environ.setdefault("GROQ_API_KEY", "test-dummy-key")
 
 import pytest
 from langchain_core.messages import AIMessage

@@ -87,7 +87,9 @@ class Order(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
-    status: Mapped[str] = mapped_column(String(20), default="ordered", index=True)
+    # 32 chars: long enough for "pending_refund_approval" (23) and
+    # "refund_rejected" (16) alongside the shorter statuses.
+    status: Mapped[str] = mapped_column(String(32), default="ordered", index=True)
     # UNIQUE, not just indexed: this is what makes a repeated checkout with
     # the same key a no-op at the database level, even under concurrent
     # requests - a second INSERT with the same key raises IntegrityError

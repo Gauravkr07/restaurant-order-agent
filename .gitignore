@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+eval/last_run.json

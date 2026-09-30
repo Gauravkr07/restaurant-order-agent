@@ -316,6 +316,41 @@ def checkout_endpoint(
     )
 
 
+# --- human-in-the-loop refund approval (V3.3) ---
+# No admin UI yet - these are plain endpoints a human (you, today) calls
+# directly, e.g. via curl/Postman, after reviewing a large refund. See
+# db/repository.py's request_refund for the >10,000 threshold logic that
+# routes an order here in the first place.
+
+class RefundDecisionResponse(BaseModel):
+    order_id: int
+    status: str
+
+
+@app.post("/orders/{order_id}/approve-refund")
+def approve_refund_endpoint(order_id: int) -> RefundDecisionResponse:
+    order = repository.approve_refund(order_id)
+    if order is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No order with that id is awaiting refund approval.",
+        )
+    logger.info("refund_approved", extra={"order_id": order_id})
+    return RefundDecisionResponse(order_id=order["order_id"], status=order["status"])
+
+
+@app.post("/orders/{order_id}/reject-refund")
+def reject_refund_endpoint(order_id: int) -> RefundDecisionResponse:
+    order = repository.reject_refund(order_id)
+    if order is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No order with that id is awaiting refund approval.",
+        )
+    logger.info("refund_rejected", extra={"order_id": order_id})
+    return RefundDecisionResponse(order_id=order["order_id"], status=order["status"])
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("service:app", host="0.0.0.0", port=8000, reload=True)

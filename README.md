@@ -206,6 +206,16 @@ What's covered (see `prompt_testcase.md` for the full spec this suite was built 
 - **3-strike session close**: consecutive unclear messages incrementing `unclear_count`, and the 3rd one closing the session (`test_clarify.py`).
 - **Flaky-extraction retry**: `extract_requested_items` retrying once on a `groq.GroqError` and raising once retries are exhausted (`test_extract_requested_items.py`).
 
+## Evaluation
+
+`eval/` measures actual LLM behavior against real Groq calls (not mocked — see [Testing](#testing) for the offline correctness suite). A scoped-down eval set (not the originally-discussed 100+ scenarios — see `prompt_implementation.md`'s dated notes) covering intent classification, clarification, task completion, and prompt injection:
+
+```bash
+python -m eval.run_eval
+```
+
+Requires `DATABASE_URL` and a real `GROQ_API_KEY`. Runs each scenario through the real graph, reports per-scenario pass/fail plus aggregate metrics (intent accuracy, task completion rate, clarification rate, latency, token usage), and writes full results to `eval/last_run.json`. This suite already caught one real bug: `checkout` on an empty cart still unconditionally fell through to `cooking_stage`/`delivery`, so the model would confirm a "delivered" order that was never actually created — fixed via a `route_after_checkout` conditional edge that only proceeds to cooking when `checkout` actually set an `order_id`.
+
 ## CI/CD
 
 `.github/workflows/ci.yml` runs on GitHub Actions with two jobs:

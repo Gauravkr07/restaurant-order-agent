@@ -372,3 +372,67 @@ def update_order_status(order_id: int, status: str, expected_version: int | None
         db.commit()
         db.refresh(order)
         return _order_to_dict(order)
+
+
+# ---- Refunds (V3.3 human-in-the-loop) ---------------------------------
+#
+# There's no separate payments/refund-amount table yet, so the order
+# total (sum of order_items) stands in for "refund amount" - see
+# prompt_implementation.md's dated notes for why. If a real payments
+# table gets built later, swap get_order_total's source for the actual
+# amount charged instead of re-deriving it from line items.
+
+REFUND_APPROVAL_THRESHOLD = 10_000  # INR; above this, a human must approve
+
+
+def get_order_total(order_id: int) -> float | None:
+    with SessionLocal() as db:
+        order = db.get(Order, order_id)
+        if order is None:
+            return None
+        return sum(float(oi.price_at_order) * oi.quantity for oi in order.items)
+
+
+def request_refund(order_id: int) -> dict | None:
+    """Called when cooking has permanently failed and a refund is owed.
+    Small refunds (<= REFUND_APPROVAL_THRESHOLD) are auto-approved
+    immediately (status -> "refunded"). Large refunds instead pause at
+    status "pending_refund_approval" until a human calls approve_refund
+    or reject_refund (see the /orders/{id}/approve-refund and
+    /reject-refund endpoints in service.py) - LangGraph's own graph run
+    already ended by the time this matters, so "pausing" here just means
+    the order sits in this status rather than the conversation itself
+    being suspended (see prompt_implementation.md for why this app uses
+    an application-level pause instead of a LangGraph checkpointer)."""
+    total = get_order_total(order_id)
+    if total is None:
+        return None
+    if total > REFUND_APPROVAL_THRESHOLD:
+        return update_order_status(order_id, "pending_refund_approval")
+    return update_order_status(order_id, "refunded")
+
+
+def approve_refund(order_id: int) -> dict | None:
+    with SessionLocal() as db:
+        order = db.get(Order, order_id)
+        if order is None or order.status != "pending_refund_approval":
+            return None
+        order.status = "refunded"
+        order.version += 1
+        order.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(order)
+        return _order_to_dict(order)
+
+
+def reject_refund(order_id: int) -> dict | None:
+    with SessionLocal() as db:
+        order = db.get(Order, order_id)
+        if order is None or order.status != "pending_refund_approval":
+            return None
+        order.status = "refund_rejected"
+        order.version += 1
+        order.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(order)
+        return _order_to_dict(order)

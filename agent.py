@@ -456,7 +456,14 @@ def checkout(state: State) -> dict:
             ("human", "Tell the customer their cart is empty, so there is "
                       "nothing to order yet."),
         ])
-        return {"unclear_count": 0, "messages": [response]}
+        # Explicitly clear order_id rather than leaving it unset: an
+        # unset key here would fall back to service.py's carried-over
+        # counters["order_id"] from a PREVIOUS completed order in this
+        # same session, which route_after_checkout would then wrongly
+        # treat as "a new order was just placed" and re-run cooking/
+        # delivery for that old order (a real bug the eval suite caught
+        # - see eval/ and prompt_implementation.md).
+        return {"unclear_count": 0, "order_id": None, "messages": [response]}
 
     logger.info("order_created", extra={"order_id": order["order_id"], "item_count": len(order["items"])})
     cart_text = "\n".join(f"{i['quantity']} x {i['item']}" for i in order["items"])
@@ -502,16 +509,30 @@ def cooking_stage(state: State) -> dict:
             "cooking_failed_permanently",
             extra={"order_id": order_id, "retries_exhausted": retry_count},
         )
-        if order_id is not None:
-            repository.update_order_status(order_id, "refunded")
-        response = llm.invoke([
-            ("system", "You are a polite restaurant assistant. Apologize "
-                       "sincerely that the kitchen could not prepare the order "
-                       "after multiple attempts, and let the customer know a "
-                       "refund will be issued."),
-            ("human", f"Order #{order_id if order_id else '?'} could not "
-                      "be cooked after retries."),
-        ])
+        refund_order = repository.request_refund(order_id) if order_id is not None else None
+        pending_approval = refund_order is not None and refund_order["status"] == "pending_refund_approval"
+        if pending_approval:
+            logger.warning("refund_pending_human_approval", extra={"order_id": order_id})
+            response = llm.invoke([
+                ("system", "You are a polite restaurant assistant. Apologize "
+                           "sincerely that the kitchen could not prepare the "
+                           "order after multiple attempts. Explain that because "
+                           "the order value is large, the refund needs a quick "
+                           "manual review before it's processed, and it will be "
+                           "handled shortly."),
+                ("human", f"Order #{order_id if order_id else '?'} could not "
+                          "be cooked after retries; refund is large and needs "
+                          "manual approval."),
+            ])
+        else:
+            response = llm.invoke([
+                ("system", "You are a polite restaurant assistant. Apologize "
+                           "sincerely that the kitchen could not prepare the order "
+                           "after multiple attempts, and let the customer know a "
+                           "refund will be issued."),
+                ("human", f"Order #{order_id if order_id else '?'} could not "
+                          "be cooked after retries."),
+            ])
         return {
             "status": "regretted",
             "cook_retry_count": 0,
@@ -548,6 +569,17 @@ def delivery(state: State) -> dict:
     return {"status": "delivered", "messages": [response]}
 
 
+def route_after_checkout(state: State) -> Literal["COOK", "END"]:
+    # checkout() only sets order_id on a genuine new order; on an empty
+    # cart it returns early with just an apology message and no order_id
+    # left over in state, so this correctly stays there instead of
+    # falling through to cooking_stage for a nonexistent order (a real
+    # bug the eval suite caught - see eval/ and prompt_implementation.md).
+    if state.get("order_id") is not None:
+        return "COOK"
+    return "END"
+
+
 def route_after_cooking(state: State) -> Literal["DELIVER", "END"]:
     if state.get("status") == "cooking":
         return "DELIVER"
@@ -582,7 +614,14 @@ builder.add_edge("verify_items", END)
 builder.add_edge("remove_item", END)
 builder.add_edge("view_cart", END)
 builder.add_edge("clarify", END)
-builder.add_edge("checkout", "cooking_stage")
+builder.add_conditional_edges(
+    "checkout",
+    route_after_checkout,
+    {
+        "COOK": "cooking_stage",
+        "END": END,
+    }
+)
 builder.add_conditional_edges(
     "cooking_stage",
     route_after_cooking,

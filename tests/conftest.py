@@ -135,6 +135,19 @@ class FakeRepository:
         order["status"] = status
         return order
 
+    def get_order_total(self, order_id):
+        order = self.orders.get(order_id)
+        if order is None:
+            return None
+        return sum(i["price"] * i["quantity"] for i in order["items"])
+
+    def request_refund(self, order_id):
+        total = self.get_order_total(order_id)
+        if total is None:
+            return None
+        status = "pending_refund_approval" if total > 10_000 else "refunded"
+        return self.update_order_status(order_id, status)
+
 
 @pytest.fixture
 def fake_llm(monkeypatch):

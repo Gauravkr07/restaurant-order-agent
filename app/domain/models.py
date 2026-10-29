@@ -23,7 +23,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from db.base import Base
+from app.domain.base import Base
 
 
 def _utcnow() -> datetime:

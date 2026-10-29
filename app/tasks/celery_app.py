@@ -1,19 +1,17 @@
 """
 Celery app instance, using Redis as both broker and result backend (the
 same Redis already used for session counters and the checkout lock - see
-service.py - so no new infrastructure beyond what's already running).
+app/domain/session_store.py - so no new infrastructure beyond what's already running).
 """
-import os
-
 from celery import Celery
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+from app.core.config import settings
 
 celery_app = Celery(
     "restaurant_order_agent",
-    broker=REDIS_URL,
-    backend=REDIS_URL,
-    include=["tasks.order_tasks"],
+    broker=settings.redis_url,
+    backend=settings.redis_url,
+    include=["app.tasks.order_tasks"],
 )
 
 celery_app.conf.update(

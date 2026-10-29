@@ -9,4 +9,4 @@ COPY . .
 
 EXPOSE 8000
 
-CMD alembic upgrade head && python -m db.seed && uvicorn service:app --host 0.0.0.0 --port 8000
+CMD alembic upgrade head && python -m app.domain.seed && uvicorn app.main:app --host 0.0.0.0 --port 8000

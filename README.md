@@ -14,17 +14,51 @@ A LangGraph-based restaurant ordering agent, exposed as a FastAPI service.
 
 ## Structure
 
-- `agent.py` — the LangGraph agent: intent routing, item verification, cart, checkout, cooking, delivery. Core logic only, no HTTP.
-- `service.py` — thin FastAPI service layer that wraps `agent.py` and exposes it over HTTP as a single stateful `/chat` endpoint.
-- `helpers/constants.py` — static data (currently the `MENU`).
-- `helpers/llm.py` — LLM client setup/connectivity (the `ChatGroq` instance), imported by `agent.py`.
-- `helpers/models.py` — Pydantic/data models (`RequestedItem`, `RequestedItems`, `State`, `Status`), imported by `agent.py`.
-- `helpers/logging_config.py` — structured JSON logging setup, shared across `agent.py` and `service.py` (see [Logging](#logging)).
-- `db/models.py` / `db/repository.py` / `db/seed.py` — the data layer: SQLAlchemy models, the repository ("Tools") layer, and a menu seed script (see [Data layer](#data-layer)).
+The app is layered so each concern has one home: HTTP in `api/`, agent
+behavior in `agents/`, graph wiring in `graph/`, data access in `domain/`,
+and cross-cutting setup in `core/`.
+
+```
+app/
+  main.py                  FastAPI app: static files, routers, exception handlers
+  api/
+    routes/chat.py         POST /chat - the conversational endpoint
+    routes/orders.py       order tracking, idempotent checkout, refund approval
+    routes/menu.py         GET /menu
+    schemas.py             request/response models
+    errors.py              every exception handler, in one place
+  agents/
+    cart_agent.py          tool-calling agents for adding/removing cart items
+    order_agent.py         tool-calling agent for existing orders (status/refund/cancel)
+    runtime.py             shared tool loop, structured-output retries, reply composition
+    prompts.py             every system prompt, in one place
+    schemas.py             structured LLM outputs (RequestedItem, AddItemVerdict, ...)
+  graph/
+    builder.py             StateGraph wiring only
+    nodes.py               one function per conversation step
+    state.py               State + Status enum
+  core/
+    config.py              all env vars, typed and validated at boot
+    guardrails.py          prompt-injection filter + untrusted-input notice
+    llm.py                 the shared ChatGroq client
+    logging.py             structured JSON logging
+  domain/
+    models.py              SQLAlchemy models
+    repository.py          data access (see Data layer)
+    session_store.py       per-turn session counters in Redis
+    seed.py                menu seed script
+  tools/
+    menu.py cart.py order.py   LangChain tools the agents call
+  tasks/                   Celery post-checkout fan-out
+```
+
+Supporting directories:
+
 - `alembic/` — database migrations.
 - `static/index.html` — a minimal browser chat UI for `/chat` (plain HTML/JS, no build step). Its Checkout button calls `POST /checkout` directly (not a chat message), generating and reusing an `Idempotency-Key` per cart so a double-click can't create two orders — see [Endpoints](#endpoints).
+- `tests/` — pytest suite covering the graph nodes (see [Testing](#testing)).
+- `eval/` — scenario suite run against the real LLM (see [Evaluation](#evaluation)).
 - `demo.png` — screenshot of the UI, shown at the top of this README (not committed by default — add your own).
-- `tests/` — pytest suite covering `agent.py`'s nodes (see [Testing](#testing)).
 - `Dockerfile` / `docker-compose.yml` — containerized app + Postgres + Redis (see [Run with Docker](#run-with-docker)).
 - `.env.example` — copy to `.env` and fill in your `GROQ_API_KEY` (and optionally `DATABASE_URL`, `REDIS_URL`, `LANGSMITH_*`).
 
@@ -48,13 +82,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # then edit .env with your real GROQ_API_KEY
 alembic upgrade head
-python -m db.seed
+python -m app.domain.seed
 ```
 
 ## Run
 
 ```bash
-uvicorn service:app --reload
+uvicorn app.main:app --reload
 ```
 
 Service runs at http://localhost:8000:
@@ -75,7 +109,7 @@ This starts three containers:
 
 - `postgres` — a `postgres:16-alpine` container, persisted via a named volume (`postgres-data`), exposed on host port **5433** (not 5432, to avoid clashing with a local Postgres install).
 - `redis` — a `redis:7-alpine` container, persisted via a named volume (`redis-data`).
-- `app` — the FastAPI service, built from the `Dockerfile`. On start it runs `alembic upgrade head` then `python -m db.seed` automatically, then starts `uvicorn`. Connects to both over Docker's internal network (`postgres:5432`, `redis:6379` — service names, not `localhost`).
+- `app` — the FastAPI service, built from the `Dockerfile`. On start it runs `alembic upgrade head` then `python -m app.domain.seed` automatically, then starts `uvicorn`. Connects to both over Docker's internal network (`postgres:5432`, `redis:6379` — service names, not `localhost`).
 
 `docker-compose.yml` reads `GROQ_API_KEY` from your `.env` file in the same directory. The app container waits for both `postgres` and `redis` to report healthy before starting.
 
@@ -136,20 +170,20 @@ This is the difference between a *classifier* (always outputs one of N fixed lab
 
 **PostgreSQL is the source of truth** for menu, sessions, carts, and orders — not Redis. Architecture: `FastAPI → LangGraph → db/repository.py ("Tools") → PostgreSQL`.
 
-- `db/models.py` — SQLAlchemy models for 6 tables: `menu_items`, `sessions`, `carts`, `cart_items`, `orders`, `order_items`. (`restaurants`/`users`/`payments`/`agent_runs` were considered and deliberately left out — see `prompt_implementation.md`'s dated instructions for why.)
-- `db/repository.py` — the only place that talks to Postgres. Each function opens its own short session, does one unit of work, commits. `agent.py`'s nodes call these as plain functions (e.g. `repository.add_cart_item(session_id, "pizza", 2)`), never touching SQL directly.
+- `app/domain/models.py` — SQLAlchemy models for 6 tables: `menu_items`, `sessions`, `carts`, `cart_items`, `orders`, `order_items`. (`restaurants`/`users`/`payments`/`agent_runs` were considered and deliberately left out — see `prompt_implementation.md`'s dated instructions for why.)
+- `app/domain/repository.py` — the only place that talks to Postgres. Each function opens its own short session, does one unit of work, commits. the graph's nodes call these as plain functions (e.g. `repository.add_cart_item(session_id, "pizza", 2)`), never touching SQL directly.
 - `alembic/` — migrations. `alembic upgrade head` applies them; runs automatically on container start (see `Dockerfile`).
-- `db/seed.py` — seeds `menu_items` with the starter menu (`python -m db.seed`); safe to re-run.
+- `app/domain/seed.py` — seeds `menu_items` with the starter menu (`python -m app.domain.seed`); safe to re-run.
 - Cart merge-not-replace, one-cart-per-session, etc. are enforced by DB constraints (`uq_cart_item`, unique `carts.session_id`), not just application logic — see the initial migration in `alembic/versions/`.
 - `checkout` snapshots each line's price into `order_items.price_at_order`, so a later menu price change never rewrites history.
 
-**Redis** now only holds per-turn session counters (`status`, `query_count`, `cook_retry_count`, `unclear_count`, `turn_count`) — cache/session-scoped, not the source of truth for anything durable. Keys still auto-expire after 24h of inactivity (`SESSION_TTL_SECONDS` in `service.py`).
+**Redis** now only holds per-turn session counters (`status`, `query_count`, `cook_retry_count`, `unclear_count`, `turn_count`) — cache/session-scoped, not the source of truth for anything durable. Keys still auto-expire after 24h of inactivity (`SESSION_TTL_SECONDS`, see `app/core/config.py`).
 
 `LangGraph`'s own state-update mechanism (`State`, returned from each node, merged by the graph) is unchanged and still how nodes communicate *within* one `/chat` call — `State` just no longer carries `cart`/`order` copies, only `session_id`, `order_id`, and the routing/counter fields, since the durable data lives in Postgres and is fetched fresh via the repository whenever a node needs it.
 
 ## Debugging & tracing (LangSmith)
 
-By default there's no visibility into what the graph actually did on a given turn — which node ran, how long each LLM call took, how many tokens it used, or where an error came from. [LangSmith](https://smith.langchain.com) (LangChain's own tracing platform) plugs into that gap with basically no code changes, since `agent.py` is already built with `langchain-core`/`langgraph`, both of which know how to emit traces to it automatically.
+By default there's no visibility into what the graph actually did on a given turn — which node ran, how long each LLM call took, how many tokens it used, or where an error came from. [LangSmith](https://smith.langchain.com) (LangChain's own tracing platform) plugs into that gap with basically no code changes, since the agent is already built with `langchain-core`/`langgraph`, both of which know how to emit traces to it automatically.
 
 To turn it on, add these to `.env` (see `.env.example`):
 
@@ -170,7 +204,7 @@ Leaving `LANGSMITH_TRACING` unset (or `false`) disables tracing entirely — the
 
 ## Logging
 
-The app logs structured JSON lines to stdout (`helpers/logging_config.py`) — no log files to manage, since `docker compose logs` (or any container log driver) already captures and retains stdout. Each line is one JSON object, e.g.:
+The app logs structured JSON lines to stdout (`app/core/logging.py`) — no log files to manage, since `docker compose logs` (or any container log driver) already captures and retains stdout. Each line is one JSON object, e.g.:
 
 ```json
 {"timestamp": "2026-09-30T04:07:49+0000", "level": "INFO", "logger": "agent", "message": "route_intent_decision", "session_id": "8e85fbe9-...", "intent": "ADD_ITEM", "route": "VERIFY_ITEMS"}
@@ -180,16 +214,16 @@ What's logged:
 
 - **Every graph node execution** (`node_show_menu`, `node_verify_items`, `node_add_item`, etc.) and the routing decisions `route_intent` makes, with the classified intent and the node it routed to.
 - **Guardrail events**: prompt injection attempts caught (`prompt_injection_detected`), extraction retries and failures, session closures (3-strike unclear limit, verify-attempt limit, cooking failures, turn-count limit).
-- **Request-level timing**: `chat_request`/`chat_response` in `service.py` log message length in, final status and total duration (`duration_ms`) out.
+- **Request-level timing**: `chat_request`/`chat_response` in `app/api/routes/chat.py` log message length in, final status and total duration (`duration_ms`) out.
 - **Errors**: every Groq exception handler and the LLM-failure fallback path log with a full traceback (`exc_info=True`), and validation errors log the specific field(s) that failed.
 
-Every log line emitted while handling a `/chat` request — whether from `service.py` or from a graph node deep inside `agent.py` — automatically carries the same `session_id`, via a `contextvars.ContextVar` set once per request (see `current_session_id` in `helpers/logging_config.py`). This makes it possible to filter logs down to one customer's entire conversation without threading a session id through every function signature.
+Every log line emitted while handling a `/chat` request — whether from the HTTP layer or from a graph node — automatically carries the same `session_id`, via a `contextvars.ContextVar` set once per request (see `current_session_id` in `app/core/logging.py`). This makes it possible to filter logs down to one customer's entire conversation without threading a session id through every function signature.
 
 Set `LOG_LEVEL` in `.env` to control verbosity (defaults to `INFO`; use `DEBUG` for more detail, `WARNING` to quiet things down).
 
 ## Testing
 
-The test suite covers `agent.py`'s node functions directly — the LLM is replaced with a fake (`tests/conftest.py`'s `FakeLLM`) so tests run offline, deterministically, and in well under a second. No *real* Groq API key or running Redis server is required — `conftest.py` sets a harmless placeholder key so `ChatGroq` can construct itself, but no real request is ever made.
+The test suite covers the graph's node functions directly — the LLM is replaced with a fake (`tests/conftest.py`'s `FakeLLM`) so tests run offline, deterministically, and in well under a second. No *real* Groq API key or running Redis server is required — `conftest.py` sets a harmless placeholder key so `ChatGroq` can construct itself, but no real request is ever made.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -220,7 +254,7 @@ Requires `DATABASE_URL` and a real `GROQ_API_KEY`. Runs each scenario through th
 
 `.github/workflows/ci.yml` runs on GitHub Actions with two jobs:
 
-- **`test`** — on every push (any branch) and every pull request targeting `main`: installs `requirements-dev.txt` and runs the full `pytest` suite. No Groq API key or Redis instance needed, since the suite is fully offline (see [Testing](#testing)) — `tests/conftest.py` sets a dummy `GROQ_API_KEY` before `agent.py` is imported, since `ChatGroq`'s constructor requires *some* key to be present even though the fake LLM used in tests never makes a real call.
+- **`test`** — on every push (any branch) and every pull request targeting `main`: installs `requirements-dev.txt` and runs the full `pytest` suite. No Groq API key or Redis instance needed, since the suite is fully offline (see [Testing](#testing)) — `tests/conftest.py` sets a dummy `GROQ_API_KEY` before the app is imported, since `ChatGroq`'s constructor requires *some* key to be present even though the fake LLM used in tests never makes a real call.
 - **`publish`** — only after `test` passes, and only on a direct push to `main` (`needs: test` + a branch/event condition, so a broken build can never be published): builds the Docker image and pushes it to GitHub Container Registry as `ghcr.io/gauravkr07/restaurant-order-agent:latest` and `:<commit-sha>` (the repository name is lowercased in its own step, since Docker tags reject uppercase). Uses the automatic `GITHUB_TOKEN` GitHub provides to every workflow run — no extra secrets or accounts to set up.
 
 This covers CI (automated testing on every change) and CD up through "produce a deployable, versioned image" — it does not deploy that image anywhere yet, since that depends on where you eventually host the app (a VPS, a cloud container service, etc.), which is a separate decision.
@@ -278,4 +312,4 @@ Customers can also ask about an existing order **conversationally** through `/ch
 ## Roadmap
 
 - Payment integration (not yet implemented)
-- HTTP-layer tests for `service.py` (session lifecycle, 404/409 handling) — the current suite tests `agent.py`'s graph nodes directly
+- HTTP-layer tests for `app/api/` (session lifecycle, 404/409 handling) — the current suite tests the graph nodes directly

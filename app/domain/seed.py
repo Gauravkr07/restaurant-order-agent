@@ -8,8 +8,8 @@ Usage: python -m db.seed
 """
 from sqlalchemy import select
 
-from db.base import SessionLocal
-from db.models import MenuItem
+from app.domain.base import SessionLocal
+from app.domain.models import MenuItem
 
 STARTER_MENU = {
     "pizza": {"price": 200, "stock": 20},

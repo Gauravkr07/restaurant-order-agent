@@ -46,7 +46,7 @@ services:
 
   celery-worker:
     build: .
-    command: celery -A tasks.celery_app worker --loglevel=info
+    command: celery -A app.tasks.celery_app worker --loglevel=info
     environment:
       - REDIS_URL=redis://redis:6379/0
       - DATABASE_URL=postgresql+psycopg://restaurant:restaurant@postgres:5432/restaurant_order_agent

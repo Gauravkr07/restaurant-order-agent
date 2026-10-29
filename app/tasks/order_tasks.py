@@ -13,8 +13,8 @@ import time
 
 from celery import group
 
-from helpers.logging_config import get_logger
-from tasks.celery_app import celery_app
+from app.core.logging import get_logger
+from app.tasks.celery_app import celery_app
 
 logger = get_logger(__name__)
 

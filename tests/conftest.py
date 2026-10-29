@@ -9,8 +9,6 @@ from langchain_core.messages import AIMessage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from helpers.models import RequestedItem, RequestedItems
-
 MENU = {
     "pizza": {"price": 200.0, "stock": 20},
     "burger": {"price": 150.0, "stock": 15},
@@ -30,7 +28,7 @@ class FakeStructuredExtractor:
 
 
 class FakeToolCallingLLM:
-    """Stands in for llm.bind_tools([...]) in run_add_item_agent: on the
+    """Stands in for llm.bind_tools([...]) in the cart agent: on the
     first invoke() returns one AIMessage per queued tool call, then a
     final plain AIMessage with no tool_calls to end the loop."""
 
@@ -49,9 +47,7 @@ class FakeLLM:
     def __init__(self, intent="SHOW_MENU", reply_text="ok", extraction_result=None, tool_calls=None, verdict=None):
         self.intent = intent
         self.reply_text = reply_text
-        self.extraction_result = (
-            extraction_result if extraction_result is not None else RequestedItems(items=[])
-        )
+        self.extraction_result = extraction_result
         self.tool_calls = tool_calls or []
         self.verdict = verdict
         self.classify_calls = 0
@@ -75,7 +71,7 @@ class FakeLLM:
 
 
 class FakeRepository:
-    """In-memory stand-in for db.repository, keyed by session_id, so the
+    """In-memory stand-in for app.domain.repository, keyed by session_id, so the
     unit test suite stays offline/fast - no real Postgres needed here."""
 
     def __init__(self):
@@ -159,16 +155,21 @@ class FakeRepository:
 
 @pytest.fixture
 def fake_llm(monkeypatch):
+    """Patches the single shared llm wherever it was imported by name -
+    app/agents/runtime.py is the only module that calls it directly now
+    (compose_reply / invoke_structured / run_tool_loop)."""
     llm = FakeLLM()
-    monkeypatch.setattr("agent.llm", llm)
+    monkeypatch.setattr("app.agents.runtime.llm", llm)
     return llm
 
 
 @pytest.fixture
 def fake_repository(monkeypatch):
     repo = FakeRepository()
-    monkeypatch.setattr("agent.repository", repo)
-    monkeypatch.setattr("agent_tools.repository", repo)
+    monkeypatch.setattr("app.graph.nodes.repository", repo)
+    monkeypatch.setattr("app.tools.menu.repository", repo)
+    monkeypatch.setattr("app.tools.cart.repository", repo)
+    monkeypatch.setattr("app.tools.order.repository", repo)
     return repo
 
 

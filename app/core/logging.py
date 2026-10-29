@@ -1,7 +1,7 @@
 """
 Structured JSON logging, configured once and shared across the app.
 
-Usage: `from helpers.logging_config import get_logger` then
+Usage: `from app.core.logging import get_logger` then
 `logger = get_logger(__name__)`, then `logger.info("did_thing", extra={...})`.
 
 Logs go to stdout only - Docker/Compose already captures and retains
@@ -12,13 +12,14 @@ in a terminal and trivially parseable by any log aggregator later.
 import contextvars
 import json
 import logging
-import os
 import sys
+
+from app.core.config import settings
 
 _LOG_RECORD_BUILTIN_FIELDS = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__)
 
-# Set once per /chat request (see service.py) so every log line emitted
-# while handling that request - including from agent.py's node functions,
+# Set once per /chat request (see app/api/routes/chat.py) so every log
+# line emitted while handling it - including from graph node functions,
 # which have no session_id parameter of their own - carries the same
 # session_id without having to thread it through every function call.
 current_session_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -55,7 +56,7 @@ def _configure_root_logger() -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JSONFormatter())
     root.addHandler(handler)
-    root.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+    root.setLevel(settings.log_level.upper())
 
 
 def get_logger(name: str) -> logging.Logger:

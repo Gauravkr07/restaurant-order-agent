@@ -1,20 +1,20 @@
 """
-The "Tools" layer between agent.py and PostgreSQL. Every function here
-opens its own short-lived SQLAlchemy session, does one unit of work,
-commits, and closes - agent.py's node functions call these as plain
-functions and never see a session or raw SQL.
+Data-access layer between the agent graph and PostgreSQL. Every function
+here opens its own short-lived SQLAlchemy session, does one unit of work,
+commits, and closes - callers (app/tools/, app/graph/nodes.py) use these
+as plain functions and never see a session or raw SQL.
 
 Returns plain dicts/values (not ORM objects) so callers never accidentally
 touch a detached ORM instance after its session has closed.
 """
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
-from db.base import SessionLocal
-from db.models import Cart, CartItem, MenuItem, Order, OrderItem, Session
+from app.domain.base import SessionLocal
+from app.domain.models import Cart, CartItem, MenuItem, Order, OrderItem, Session
 
 
 class ConcurrentUpdateError(Exception):

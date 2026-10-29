@@ -33,8 +33,9 @@ load_dotenv(override=True)
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage
 
-import agent
-from db import repository
+from app.domain import repository
+from app.graph import graph
+from app.graph.nodes import route_intent
 from eval.dataset import SCENARIOS, Scenario
 
 
@@ -73,13 +74,13 @@ def run_scenario(scenario: Scenario) -> dict:
     actual_intent = None
     if scenario.expected_intent is not None:
         intent_state = {**state, "messages": [HumanMessage(content=last_message)]}
-        actual_intent = agent.route_intent(intent_state)
+        actual_intent = route_intent(intent_state)
 
     start = time.monotonic()
     result_state = dict(state)
     for turn in scenario.turns:
         result_state = {**result_state, "messages": [HumanMessage(content=turn)]}
-        result_state = agent.graph.invoke(result_state, config={"callbacks": [counter]})
+        result_state = graph.invoke(result_state, config={"callbacks": [counter]})
     latency_s = time.monotonic() - start
 
     actual_status = result_state.get("status")

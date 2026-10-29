@@ -357,6 +357,7 @@ Then open the service URL in a browser for the chat UI.
 
 ### Notes and limits
 
+- **Neon can drop a connection mid-query.** A suspended or recycled Neon compute surfaces as `psycopg.OperationalError: SSL error: unexpected eof while reading`. `pool_pre_ping` catches the common case (a connection that went stale while idle in the pool), but it cannot catch a connection that dies *during* a query. Deploying in the same region as the Neon project makes this rare; if you see it in production, the fix is a retry around the repository call, not a pool setting.
 - **Starter instances sleep when idle.** The first request after a sleep pays both Render's cold start and, if the Neon branch has also suspended, its wake-up — expect a slow first reply, then normal latency.
 - **Sessions live in Redis with a 24h TTL.** Redis here is a cache, not a system of record: if it's wiped, in-flight conversations reset, but carts and orders are safe in Neon.
 - **The refund-approval endpoints are unauthenticated.** `POST /orders/{id}/approve-refund` and `/reject-refund` are open to anyone who can reach the service, which is fine for a local demo and **not** fine on a public URL. Put auth in front of them before sharing the link.

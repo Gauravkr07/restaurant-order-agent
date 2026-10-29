@@ -9,12 +9,15 @@ touch a detached ORM instance after its session has closed.
 """
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
+from app.core.logging import get_logger
 from app.domain.base import SessionLocal
 from app.domain.models import Cart, CartItem, MenuItem, Order, OrderItem, Session
+
+logger = get_logger(__name__)
 
 
 class ConcurrentUpdateError(Exception):
@@ -195,6 +198,53 @@ def clear_cart(session_id: str) -> None:
 
 # ---- Orders -----------------------------------------------------------
 
+class OutOfStockError(Exception):
+    """Raised when an order can't be placed because one of its lines no
+    longer has enough stock. Carries the offending lines so the caller
+    can tell the customer exactly what ran out."""
+
+    def __init__(self, shortfalls: list[dict]):
+        self.shortfalls = shortfalls
+        detail = ", ".join(
+            f"{s['item']} (wanted {s['wanted']}, {s['available']} left)" for s in shortfalls
+        )
+        super().__init__(f"insufficient stock: {detail}")
+
+
+def _reserve_stock(db, cart_items) -> None:
+    """Decrement menu stock for every cart line, inside the caller's
+    transaction. Raises OutOfStockError (rolling the caller back) if any
+    line can't be satisfied.
+
+    The decrement is a single conditional UPDATE per line
+    (... SET stock = stock - :qty WHERE id = :id AND stock >= :qty), so
+    the check and the write are one atomic operation in the database.
+    Reading the stock first and then writing it would leave a window
+    where two concurrent checkouts both see the last item available and
+    both succeed; here the second UPDATE simply matches zero rows.
+    """
+    shortfalls = []
+    for cart_item in cart_items:
+        updated = db.execute(
+            update(MenuItem)
+            .where(MenuItem.id == cart_item.menu_item_id, MenuItem.stock >= cart_item.quantity)
+            .values(stock=MenuItem.stock - cart_item.quantity)
+        ).rowcount
+        if not updated:
+            menu_item = db.get(MenuItem, cart_item.menu_item_id)
+            shortfalls.append(
+                {
+                    "item": menu_item.name if menu_item else str(cart_item.menu_item_id),
+                    "wanted": cart_item.quantity,
+                    "available": menu_item.stock if menu_item else 0,
+                }
+            )
+    if shortfalls:
+        db.rollback()
+        logger.warning("order_rejected_out_of_stock", extra={"shortfalls": shortfalls})
+        raise OutOfStockError(shortfalls)
+
+
 def create_order_from_cart(session_id: str) -> dict | None:
     """Snapshots the current cart into a new order (with price_at_order
     frozen at today's menu price) and empties the cart, all in one
@@ -203,6 +253,8 @@ def create_order_from_cart(session_id: str) -> dict | None:
         cart = db.scalar(select(Cart).where(Cart.session_id == session_id))
         if cart is None or not cart.items:
             return None
+
+        _reserve_stock(db, cart.items)
 
         order = Order(session_id=session_id, status="ordered")
         db.add(order)
@@ -276,6 +328,8 @@ def create_order_idempotent(session_id: str, idempotency_key: str) -> tuple[dict
             existing = _get_order_by_idempotency_key(idempotency_key)
             assert existing is not None, "unique violation but no matching order found"
             return existing, False
+
+        _reserve_stock(db, cart.items)
 
         items_snapshot = []
         for cart_item in cart.items:
@@ -393,36 +447,62 @@ def get_order_total(order_id: int) -> float | None:
         return sum(float(oi.price_at_order) * oi.quantity for oi in order.items)
 
 
-# Orders in these statuses can have a refund requested against them:
-# - "ordered": cooking_stage's own call, when cooking has permanently
-#   failed (the order's DB status is still "ordered" at that point -
-#   "regretted" only ever exists as the session/conversation status,
-#   set separately in agent.py's State, not written to orders.status).
-# - "delivered": a customer asking for a refund after the fact via chat.
+# A customer can only request a refund against food they actually
+# received. "ordered" is deliberately NOT here: that status means the
+# order was placed but has not been delivered, so refunding it would pay
+# out for food the kitchen may still be about to serve. An order that
+# hasn't started cooking is cancelled (cancel_order), not refunded.
 # Already-"refunded"/"pending_refund_approval"/"refund_rejected"/
 # "cancelled" orders are excluded so a refund can't be requested twice.
-REFUNDABLE_STATUSES = ("ordered", "delivered")
+REFUNDABLE_STATUSES = ("delivered",)
+
+# The kitchen's own path. When cooking fails permanently the order's DB
+# status is still "ordered" ("regretted" only ever exists as the
+# session/conversation status, never written to orders.status), so
+# cooking_stage has to be able to refund an undelivered order - the
+# customer paid and will get nothing. This is the ONLY caller allowed to
+# do that, which is why it takes an explicit flag rather than widening
+# REFUNDABLE_STATUSES for everyone.
+KITCHEN_FAILURE_REFUNDABLE_STATUSES = ("ordered", "cooking", "delivered")
 
 
-def request_refund(order_id: int) -> dict | None:
-    """Called either when cooking has permanently failed (cooking_stage)
-    or when a customer asks for a refund on a delivered order (the
-    request_refund_for_order tool, via chat). Returns None if the order
-    doesn't exist or isn't in a refundable status - see
-    REFUNDABLE_STATUSES.
+def request_refund(order_id: int, *, kitchen_failure: bool = False) -> dict | None:
+    """Request a refund for an order.
+
+    By default only a delivered order can be refunded - this is the path
+    a customer reaches through chat (the request_refund_for_order tool).
+
+    `kitchen_failure=True` is for cooking_stage's own call when cooking
+    has permanently failed, which must also cover an undelivered order.
+    Customer-facing callers must never set it.
+
+    Returns None if the order doesn't exist or isn't in a refundable
+    status for that caller.
 
     Small refunds (<= REFUND_APPROVAL_THRESHOLD) are auto-approved
     immediately (status -> "refunded"). Large refunds instead pause at
     status "pending_refund_approval" until a human calls approve_refund
     or reject_refund (see the /orders/{id}/approve-refund and
-    /reject-refund endpoints in service.py) - LangGraph's own graph run
-    already ended by the time this matters, so "pausing" here just means
-    the order sits in this status rather than the conversation itself
-    being suspended (see prompt_implementation.md for why this app uses
-    an application-level pause instead of a LangGraph checkpointer)."""
+    /reject-refund endpoints in app/api/routes/orders.py) - LangGraph's
+    own graph run already ended by the time this matters, so "pausing"
+    here just means the order sits in this status rather than the
+    conversation itself being suspended (see prompt_implementation.md
+    for why this app uses an application-level pause instead of a
+    LangGraph checkpointer)."""
+    allowed = (
+        KITCHEN_FAILURE_REFUNDABLE_STATUSES if kitchen_failure else REFUNDABLE_STATUSES
+    )
     with SessionLocal() as db:
         order = db.get(Order, order_id)
-        if order is None or order.status not in REFUNDABLE_STATUSES:
+        if order is None or order.status not in allowed:
+            logger.info(
+                "refund_refused",
+                extra={
+                    "order_id": order_id,
+                    "order_status": order.status if order else None,
+                    "kitchen_failure": kitchen_failure,
+                },
+            )
             return None
     total = get_order_total(order_id)
     if total is None:

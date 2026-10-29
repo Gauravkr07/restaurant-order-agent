@@ -16,6 +16,7 @@ from app.agents.runtime import compose_reply
 from app.core.guardrails import looks_like_prompt_injection
 from app.core.logging import get_logger
 from app.domain import repository
+from app.domain.repository import OutOfStockError
 from app.graph.state import State, Status
 from app.tools import checkout as checkout_tool
 
@@ -208,7 +209,19 @@ def checkout(state: State) -> dict:
     decision-making needed, so this calls the checkout tool directly
     rather than running a full tool-calling loop for it."""
     logger.info("node_checkout")
-    order = checkout_tool.invoke({"session_id": state["session_id"]})
+    try:
+        order = checkout_tool.invoke({"session_id": state["session_id"]})
+    except OutOfStockError as exc:
+        # Someone else bought the last of something between this cart
+        # being filled and checkout. Nothing was ordered and the cart is
+        # untouched, so the customer can adjust it and try again.
+        logger.warning("checkout_out_of_stock", extra={"shortfalls": exc.shortfalls})
+        shortfall_text = "; ".join(
+            f"{s['item']}: wanted {s['wanted']}, only {s['available']} left"
+            for s in exc.shortfalls
+        )
+        response = compose_reply(prompts.CHECKOUT_OUT_OF_STOCK, shortfall_text)
+        return {"unclear_count": 0, "order_id": None, "messages": [response]}
 
     if order is None:
         response = compose_reply(
@@ -262,7 +275,11 @@ def cooking_stage(state: State) -> dict:
             "cooking_failed_permanently",
             extra={"order_id": order_id, "retries_exhausted": retry_count},
         )
-        refund_order = repository.request_refund(order_id) if order_id is not None else None
+        refund_order = (
+            repository.request_refund(order_id, kitchen_failure=True)
+            if order_id is not None
+            else None
+        )
         pending_approval = (
             refund_order is not None and refund_order["status"] == "pending_refund_approval"
         )

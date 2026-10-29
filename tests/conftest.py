@@ -9,6 +9,8 @@ from langchain_core.messages import AIMessage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.domain.repository import OutOfStockError
+
 MENU = {
     "pizza": {"price": 200.0, "stock": 20},
     "burger": {"price": 150.0, "stock": 15},
@@ -78,12 +80,15 @@ class FakeRepository:
         self.carts: dict[str, dict[str, int]] = {}
         self.orders: dict[int, dict] = {}
         self._next_order_id = 1
+        # Per-instance copy: checkout decrements stock, so sharing the
+        # module-level MENU would leak those decrements between tests.
+        self.stock = {name: item["stock"] for name, item in MENU.items()}
 
     def get_active_menu_items(self):
-        return [{"name": k, **v} for k, v in MENU.items()]
+        return [{"name": k, **v, "stock": self.stock[k]} for k, v in MENU.items()]
 
     def get_menu_item(self, name):
-        return {"name": name, **MENU[name]} if name in MENU else None
+        return {"name": name, **MENU[name], "stock": self.stock[name]} if name in MENU else None
 
     def get_cart_items(self, session_id):
         cart = self.carts.get(session_id, {})
@@ -113,6 +118,15 @@ class FakeRepository:
         cart = self.carts.get(session_id, {})
         if not cart:
             return None
+        shortfalls = [
+            {"item": k, "wanted": q, "available": self.stock[k]}
+            for k, q in cart.items()
+            if self.stock[k] < q
+        ]
+        if shortfalls:
+            raise OutOfStockError(shortfalls)
+        for k, q in cart.items():
+            self.stock[k] -= q
         items = [{"item": k, "quantity": q, "price": MENU[k]["price"]} for k, q in cart.items()]
         order_id = self._next_order_id
         self._next_order_id += 1
@@ -144,9 +158,10 @@ class FakeRepository:
             return None
         return sum(i["price"] * i["quantity"] for i in order["items"])
 
-    def request_refund(self, order_id):
+    def request_refund(self, order_id, *, kitchen_failure=False):
+        allowed = ("ordered", "cooking", "delivered") if kitchen_failure else ("delivered",)
         order = self.orders.get(order_id)
-        if order is None or order["status"] not in ("ordered", "delivered"):
+        if order is None or order["status"] not in allowed:
             return None
         total = self.get_order_total(order_id)
         status = "pending_refund_approval" if total > 100 else "refunded"

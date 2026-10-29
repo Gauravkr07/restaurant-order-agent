@@ -14,6 +14,7 @@ from app.api.schemas import (
 from app.core.config import settings
 from app.core.logging import current_session_id, get_logger
 from app.domain import repository
+from app.domain.repository import OutOfStockError
 from app.domain.session_store import redis_client
 from app.tasks.order_tasks import process_completed_order
 
@@ -68,6 +69,17 @@ def checkout_endpoint(
         )
     try:
         order, created = repository.create_order_idempotent(req.session_id, idempotency_key)
+    except OutOfStockError as exc:
+        # Nothing was ordered and the cart is untouched - the customer
+        # can adjust it and retry, so this is a 409, not a 500.
+        logger.warning("checkout_out_of_stock", extra={"shortfalls": exc.shortfalls})
+        detail = "; ".join(
+            f"{s['item']}: only {s['available']} left (you wanted {s['wanted']})"
+            for s in exc.shortfalls
+        )
+        raise HTTPException(
+            status_code=409, detail=f"Some items just went out of stock - {detail}."
+        ) from exc
     finally:
         try:
             lock.release()

@@ -152,6 +152,8 @@ Key rules baked into the graph:
 - **Verification, not blind add**: an order-style message always goes through `verify_items` first. Items are only added to the cart once stock is confirmed.
 - **3-strike limit**: `query_count` tracks failed verification attempts. On the 3rd unresolved attempt the agent sends a regret message and stops (`status = "regretted"`).
 - **Cart merge, not replace**: `add_item` sums quantities into an existing cart line for the same item instead of overwriting it.
+- **Stock is reserved at checkout, not at add-to-cart**: placing an order decrements `menu_items.stock` in the same transaction that creates the order, via a conditional `UPDATE ... WHERE stock >= quantity` per line. If any line can't be satisfied the whole order is refused (`OutOfStockError`) and nothing is written — so two people racing for the last pizza can't both get it, and stock never goes negative. The customer is told exactly what ran out and that nothing was charged.
+- **Refunds require delivery**: a customer can only be refunded for an order that actually reached them (`status = "delivered"`). An order still in `ordered` is cancelled instead, never refunded — refunding it would pay out for food that may still be served. The one exception is the kitchen's own failure path, which calls `request_refund(order_id, kitchen_failure=True)` because the customer paid and got nothing.
 - **Cooking retries**: `cooking_stage` simulates kitchen failures, retries up to 2 times (`cook_retry_count`), and if still failing apologizes and flags a refund instead of retrying forever.
 - **Stateful turns, server-side**: the graph is not one-shot. `status`, `query_count`, `cook_retry_count`, `cart`, and `order` all live in a Redis-backed session, keyed by `session_id`. The client never sees or sends these — it only ever sends a `message` (and the `session_id` after the first call).
 - **Ask, don't guess**: `route_intent` doesn't silently force ambiguous input into one of the known actions. See [Routing: classifier vs. agentic](#routing-classifier-vs-agentic) below.
@@ -235,6 +237,8 @@ What's covered (see `prompt_testcase.md` for the full spec this suite was built 
 - **Verification / retry / regret**: full availability → cart; partial availability → asks the user and increments `query_count`; 3rd failed attempt → regret message (`test_verify_items.py`).
 - **Cart merge**: adding more of an item already in the cart sums the quantity instead of replacing it (`test_add_item.py`).
 - **Cart removal**: partial removal, full removal, over-removal, and removing an item not in the cart (`test_remove_item.py`).
+- **Stock reservation** (`test_stock.py`): checkout decrements stock, an order larger than stock is refused with the shortfall reported, a refused order leaves stock untouched, and the last unit can't be sold twice.
+- **Refund rules** (`test_refund_rules.py`): only delivered orders are customer-refundable, the kitchen-failure path may still refund an undelivered order, and already-resolved orders are never refundable again.
 - **Checkout → cooking → delivery**: order creation, the cooking success/retry/regret-with-refund paths (with `random.random` monkeypatched for determinism), and delivery marking the order delivered (`test_checkout_cooking_delivery.py`).
 - **Routing**: `ADD_ITEM` → `VERIFY_ITEMS` remap, `UNCLEAR`/unparseable model output → `CLARIFY` (not a silent `SHOW_MENU` guess), and the `cooking_retry` short-circuit that skips LLM classification entirely (`test_route_intent.py`).
 - **3-strike session close**: consecutive unclear messages incrementing `unclear_count`, and the 3rd one closing the session (`test_clarify.py`).
@@ -306,6 +310,8 @@ docker run -p 8000:8000 \
 - `GET /orders/{order_id}` — public order tracking by order number (no auth — same as the rest of this app). Returns `{order_id, status, items}`, `404` if the order doesn't exist. The chat UI has a "Track order" box that calls this directly.
 
 - `POST /orders/{order_id}/approve-refund` / `POST /orders/{order_id}/reject-refund` — resolve a refund parked at `pending_refund_approval` (order total over ₹100 — see [Data layer](#data-layer)). No admin UI yet; call these directly. `404` if the order isn't currently awaiting approval.
+
+A refund is only possible on a **delivered** order; asking for a refund on an order that hasn't arrived yet gets it cancelled instead (see [Conversation flow](#conversation-flow)).
 
 Customers can also ask about an existing order **conversationally** through `/chat` — "what's the status of order 16?", "I'd like a refund for order 17", "cancel order 16" all route to a tool-calling flow (`get_order_status` / `request_refund_for_order` / `cancel_order`) rather than a fixed endpoint call, same pattern as ordering/cart management.
 

@@ -34,11 +34,11 @@ def get_order_status(order_id: int) -> dict | None:
 
 @tool
 def request_refund_for_order(order_id: int) -> dict | None:
-    """Request a refund for an order that has already been delivered
-    (or one that failed during cooking). Returns None if the order id
-    doesn't exist or isn't in a refundable state (e.g. it's still
-    cooking - use cancel_order for an order that hasn't started cooking
-    yet - or a refund was already requested/resolved for it).
+    """Request a refund for an order that has already been DELIVERED.
+    Returns None if the order id doesn't exist or isn't delivered - an
+    order that is still "ordered" has not reached the customer yet and
+    cannot be refunded, so use cancel_order for that instead. Also
+    returns None if a refund was already requested or resolved for it.
 
     Refunds up to ₹100 are approved immediately (returned status:
     "refunded"). Larger refunds need a human to review them first

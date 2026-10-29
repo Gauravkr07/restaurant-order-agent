@@ -315,6 +315,52 @@ A refund is only possible on a **delivered** order; asking for a refund on an or
 
 Customers can also ask about an existing order **conversationally** through `/chat` — "what's the status of order 16?", "I'd like a refund for order 17", "cancel order 16" all route to a tool-calling flow (`get_order_status` / `request_refund_for_order` / `cancel_order`) rather than a fixed endpoint call, same pattern as ordering/cart management.
 
+## Deploying (Render + Neon)
+
+[`render.yaml`](render.yaml) is a Render Blueprint describing the whole deployment: the FastAPI web service, the Celery worker, and Redis. **Postgres is not in it** — this setup uses [Neon](https://neon.tech) as an external managed Postgres, so the database outlives any single deploy and can be branched for staging.
+
+### 1. Create the Neon database
+
+Create a project in Neon, then copy the connection string for the **pooled** endpoint (its host contains `-pooler`). Keep the `sslmode=require` parameter — Neon refuses unencrypted connections.
+
+The scheme Neon gives you (`postgresql://`) is rewritten to `postgresql+psycopg://` automatically in [`app/core/config.py`](app/core/config.py), because SQLAlchemy only picks psycopg 3 when the scheme says so and would otherwise reach for the uninstalled psycopg2. So paste the string exactly as Neon shows it.
+
+### 2. Deploy the blueprint
+
+Push the repo to GitHub, then in Render choose **New > Blueprint** and select it. Render reads `render.yaml` and creates all three services. It will prompt for the two secrets marked `sync: false`, which are never committed:
+
+| Secret | Where to get it |
+| --- | --- |
+| `DATABASE_URL` | The Neon pooled connection string from step 1 |
+| `GROQ_API_KEY` | <https://console.groq.com/keys> |
+
+`REDIS_URL` is wired automatically from the Redis service in the blueprint. Set `region` in `render.yaml` to whichever Render region is closest to your Neon region — every request makes several database round-trips, so this is the cheapest latency win available.
+
+### 3. Verify
+
+```bash
+curl https://<your-service>.onrender.com/healthz   # {"status":"ok"}
+curl https://<your-service>.onrender.com/readyz    # checks Postgres + Redis
+curl https://<your-service>.onrender.com/menu      # the seeded menu
+```
+
+Then open the service URL in a browser for the chat UI.
+
+### How the deploy is wired
+
+- **Migrations run once per deploy**, not once per replica, via `preDeployCommand` (`alembic upgrade head && python -m app.domain.seed`). Both commands are safe to re-run: Alembic skips applied revisions and the seed leaves existing menu items alone.
+- **`$PORT` is honoured.** Render injects the port to bind; the Dockerfile defaults it to 8000 so `docker compose up` still works unchanged.
+- **Two health endpoints, deliberately different.** `/healthz` touches nothing external, so a transient Redis blip can't make Render pull a healthy instance out of rotation. `/readyz` checks Postgres and Redis and returns `503` naming whichever is down — use it when diagnosing.
+- **Connection pools are small** (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`) because the web service and the worker each hold their own and share Neon's connection budget. `pool_pre_ping` plus `pool_recycle` handle Neon closing idle connections, so the first request after a quiet spell doesn't fail.
+- **Redis over TLS.** Render's connection string uses `rediss://`; Celery needs an explicit SSL config for that scheme or it won't connect. Certificates are verified — if a provider uses a CA outside the container's trust store, point `REDIS_SSL_CA_CERTS` at its bundle rather than disabling verification.
+- **The worker runs `--pool=solo`**, which suits a starter instance and avoids prefork's fork-safety issues (the same crash seen on macOS locally). Scale by adding instances, or move to `--pool=prefork --concurrency=N` on a larger plan.
+
+### Notes and limits
+
+- **Starter instances sleep when idle.** The first request after a sleep pays both Render's cold start and, if the Neon branch has also suspended, its wake-up — expect a slow first reply, then normal latency.
+- **Sessions live in Redis with a 24h TTL.** Redis here is a cache, not a system of record: if it's wiped, in-flight conversations reset, but carts and orders are safe in Neon.
+- **The refund-approval endpoints are unauthenticated.** `POST /orders/{id}/approve-refund` and `/reject-refund` are open to anyone who can reach the service, which is fine for a local demo and **not** fine on a public URL. Put auth in front of them before sharing the link.
+
 ## Roadmap
 
 - Payment integration (not yet implemented)

@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.errors import register_exception_handlers
-from app.api.routes import chat, menu, orders
+from app.api.routes import chat, health, menu, orders
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -20,6 +20,7 @@ app = FastAPI(title="Restaurant Agent Service")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 register_exception_handlers(app)
+app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(menu.router)
 app.include_router(orders.router)

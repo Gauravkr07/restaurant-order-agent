@@ -1,0 +1,112 @@
+# Render Blueprint - https://render.com/docs/blueprint-spec
+#
+# Postgres is NOT defined here: this app uses Neon (https://neon.tech)
+# as a managed, external Postgres, so DATABASE_URL is set from Neon's
+# connection string rather than provisioned by Render. Redis IS defined
+# here, because it holds only per-turn session counters, the checkout
+# lock and the Celery queue - all of which are fine to lose on a restart
+# and benefit from sitting next to the app.
+#
+# Deploy: push this file to the repo, then in Render choose
+# New > Blueprint and point it at the repo. Render reads this file and
+# creates every service below in one go.
+#
+# Two secrets are marked `sync: false`, which means Render prompts for
+# them on first deploy and never stores them in git:
+#   GROQ_API_KEY  - from https://console.groq.com/keys
+#   DATABASE_URL  - from the Neon dashboard (see README "Deploying")
+
+services:
+  # --- FastAPI web service ---
+  - type: web
+    name: restaurant-order-agent
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    # Keep this in the same region as your Neon project. Every turn makes
+    # several database round-trips, so a cross-continent hop (e.g. Render
+    # singapore <-> Neon us-east-2) adds seconds per reply.
+    region: ohio
+    healthCheckPath: /healthz
+    # Runs once per deploy, before any new instance takes traffic -
+    # unlike a Docker CMD, which would run on every replica and every
+    # restart. Both commands are safe to re-run: alembic skips applied
+    # migrations, and the seed leaves existing menu items alone.
+    preDeployCommand: alembic upgrade head && python -m app.domain.seed
+    dockerCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      # Neon connection string. Use Neon's POOLED endpoint (the host
+      # containing "-pooler") and keep ?sslmode=require - Neon rejects
+      # unencrypted connections. The `postgresql://` scheme Neon gives
+      # you is rewritten to `postgresql+psycopg://` automatically in
+      # app/core/config.py, so paste it verbatim.
+      - key: DATABASE_URL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: restaurant-order-agent-redis
+          property: connectionString
+      - key: LOG_LEVEL
+        value: INFO
+      # Keep the pool small: the web service and the Celery worker each
+      # hold their own, and they share Neon's connection budget.
+      - key: DB_POOL_SIZE
+        value: "5"
+      - key: DB_MAX_OVERFLOW
+        value: "5"
+      # Optional tracing. Set LANGSMITH_TRACING to "true" and supply a
+      # key in the Render dashboard to turn it on; the app runs the same
+      # either way.
+      - key: LANGSMITH_TRACING
+        value: "false"
+      - key: LANGSMITH_PROJECT
+        value: restaurant-order-agent
+
+  # --- Celery worker: post-checkout fan-out ---
+  # Background work only; it serves no HTTP traffic, so it's a `worker`
+  # and has no health check or port.
+  - type: worker
+    name: restaurant-order-agent-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: ohio
+    # --pool=solo keeps one task running at a time in one process, which
+    # suits a starter instance and sidesteps prefork's fork-safety
+    # problems. Raise concurrency by scaling instances, or switch to
+    # --pool=prefork --concurrency=N on a larger plan.
+    dockerCommand: celery -A app.tasks.celery_app worker --pool=solo --loglevel=info
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: restaurant-order-agent-redis
+          property: connectionString
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DB_POOL_SIZE
+        value: "2"
+      - key: DB_MAX_OVERFLOW
+        value: "2"
+      # The worker's tasks are stubs that never call the LLM, but
+      # app/core/config.py validates this at import time for every
+      # process, so it has to be present.
+      - key: GROQ_API_KEY
+        sync: false
+
+  # --- Redis: session counters, checkout lock, Celery broker ---
+  - type: redis
+    name: restaurant-order-agent-redis
+    plan: starter
+    region: ohio
+    # Only the app's own services may connect.
+    ipAllowList: []
+    # Session counters carry their own 24h TTL and the Celery queue is
+    # transient, so evicting the oldest keys under pressure is correct
+    # here - nothing durable lives in Redis.
+    maxmemoryPolicy: allkeys-lru

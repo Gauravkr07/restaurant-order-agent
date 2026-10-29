@@ -20,3 +20,18 @@ celery_app.conf.update(
     accept_content=["json"],
     task_track_started=True,
 )
+
+# A managed Redis reached over TLS uses the rediss:// scheme (Render,
+# Heroku, Upstash). Celery/kombu will not negotiate TLS for such a URL
+# unless it is given an ssl config, and fails to connect without one.
+# Certificates are verified by default. If a provider terminates TLS
+# with an internal CA that isn't in the container's trust store, supply
+# that CA via REDIS_SSL_CA_CERTS rather than turning verification off.
+if settings.redis_url.startswith("rediss://"):
+    import ssl
+
+    ssl_options = {"ssl_cert_reqs": ssl.CERT_REQUIRED}
+    if settings.redis_ssl_ca_certs:
+        ssl_options["ssl_ca_certs"] = settings.redis_ssl_ca_certs
+    celery_app.conf.broker_use_ssl = ssl_options
+    celery_app.conf.redis_backend_use_ssl = ssl_options

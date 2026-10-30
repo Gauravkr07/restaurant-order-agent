@@ -93,20 +93,63 @@ def run_tool_loop(tools: list, system_prompt: str, user_message: str, on_tool_ca
     tools_by_name = {t.name: t for t in tools}
 
     ai_message = None
-    for _ in range(MAX_TOOL_CALL_ROUNDS):
-        ai_message = tool_llm.invoke(messages)
+    for round_index in range(MAX_TOOL_CALL_ROUNDS):
+        try:
+            ai_message = tool_llm.invoke(messages)
+        except groq.APIError as exc:
+            # The model itself flaked rather than the request being bad:
+            # malformed tool-call JSON, or "Tool choice is required, but
+            # model did not call a tool". Both are transient and both
+            # used to kill the whole turn. Retry the round once from the
+            # same messages; if it flakes again, give up on the loop but
+            # return whatever the model last said, so the caller still
+            # has something to work with instead of an exception.
+            logger.warning(
+                "tool_loop_model_error",
+                extra={"round": round_index, "error": str(exc)[:200]},
+            )
+            try:
+                ai_message = tool_llm.invoke(messages)
+            except groq.APIError:
+                logger.error("tool_loop_model_error_retry_failed", exc_info=True)
+                break
+
         messages.append(ai_message)
         if not ai_message.tool_calls:
             break
+
         for call in ai_message.tool_calls:
-            tool = tools_by_name[call["name"]]
-            result = tool.invoke(call["args"])
-            if on_tool_call is not None:
-                on_tool_call(call["name"], call["args"])
+            # Hand failures back to the model as a tool result instead of
+            # raising: it can then correct itself (pick a real tool, fix
+            # the arguments) within the remaining rounds. A hallucinated
+            # tool name used to raise StopIteration and a failing tool
+            # used to propagate, in both cases losing the whole turn.
+            tool = tools_by_name.get(call["name"])
+            if tool is None:
+                logger.warning("tool_loop_unknown_tool", extra={"tool": call["name"]})
+                output = {
+                    "error": f"No tool named {call['name']!r}. "
+                    f"Available tools: {sorted(tools_by_name)}."
+                }
+            else:
+                try:
+                    output = tool.invoke(call["args"])
+                    if on_tool_call is not None:
+                        on_tool_call(call["name"], call["args"])
+                except Exception as exc:
+                    logger.warning(
+                        "tool_loop_tool_failed",
+                        extra={"tool": call["name"], "error_type": type(exc).__name__},
+                        exc_info=True,
+                    )
+                    output = {"error": f"{type(exc).__name__}: {exc}"}
+
             messages.append(
-                ToolMessage(content=json.dumps(result, default=str), tool_call_id=call["id"])
+                ToolMessage(content=json.dumps(output, default=str), tool_call_id=call["id"])
             )
     else:
         logger.warning("tool_loop_max_rounds_reached", extra={"rounds": MAX_TOOL_CALL_ROUNDS})
 
+    if ai_message is None:
+        return ""
     return ai_message.content if isinstance(ai_message.content, str) else str(ai_message.content)
